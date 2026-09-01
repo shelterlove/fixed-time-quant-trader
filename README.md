@@ -3,6 +3,8 @@
 一个固定时点、多空组合的因果回测工程。唯一策略规格为
 [`STRATEGY_DEVELOPMENT_WHITEPAPER.md`](STRATEGY_DEVELOPMENT_WHITEPAPER.md)；
 [`strategy.toml`](strategy.toml) 保存已冻结的参数、窗口和运行权限。
+策略版本为 `1.1.0`，研究引擎版本为 `1.1.1`；冻结结果见
+[`BASELINE.md`](BASELINE.md)。
 
 ## 架构
 
@@ -69,3 +71,9 @@ pytest -q
 ```
 
 策略或经济规则有歧义时，不应通过改代码猜测；应先更新白皮书并明确确认口径。
+
+## 已验证环境
+
+- Python 3.12.10
+- Polars 1.32.0
+- pytest 9.1.1
