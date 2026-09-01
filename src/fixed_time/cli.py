@@ -41,6 +41,12 @@ def _parser() -> argparse.ArgumentParser:
     live_smoke = commands.add_parser("live-smoke", help="place and close one minimum-size Futures testnet position")
     live_smoke.add_argument("--root", default=".")
     live_smoke.add_argument("--symbol", required=True)
+    live_health = commands.add_parser("live-health", help="check whether the live trader heartbeat is fresh")
+    live_health.add_argument("--root", default=".")
+    live_dashboard = commands.add_parser("live-dashboard", help="serve the read-only live monitoring page")
+    live_dashboard.add_argument("--root", default=".")
+    live_dashboard.add_argument("--host", default="0.0.0.0")
+    live_dashboard.add_argument("--port", type=int, default=8080)
     return parser
 
 
@@ -78,6 +84,29 @@ def _authorized_window(config: StrategyConfig, command: str, window_id: str):
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "live-dashboard":
+        from .live.config import load_live_config
+        from .live.dashboard import run_dashboard
+
+        run_dashboard(load_live_config(args.root).database_path, args.host, args.port)
+        return
+    if args.command == "live-health":
+        from datetime import UTC, datetime, timedelta
+        from .live.config import load_live_config
+        from .live.state import StateStore
+
+        live_config = load_live_config(args.root)
+        if not live_config.database_path.exists():
+            raise ConfigError("live runtime database does not exist")
+        store = StateStore(live_config.database_path)
+        try:
+            status = store.runtime_status()
+        finally:
+            store.close()
+        if status is None or datetime.fromisoformat(status["heartbeat_at"]) < datetime.now(UTC) - timedelta(seconds=30):
+            raise ConfigError("live trader heartbeat is stale")
+        print({"status": "healthy", "heartbeat_at": status["heartbeat_at"]})
+        return
     if args.command.startswith("live-"):
         from .live.config import load_live_config
         from .live.engine import LiveEngine

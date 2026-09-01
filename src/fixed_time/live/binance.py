@@ -183,6 +183,24 @@ class BinanceRest:
         if str(item.get("marginType", "")).lower() != "isolated" or int(item.get("leverage", 0)) != 1:
             raise BinanceError(f"{symbol} must be isolated at 1x leverage")
 
+    def configure_symbol(self, symbol: str) -> None:
+        try:
+            self.ensure_symbol_config(symbol)
+            return
+        except BinanceError:
+            pass
+        try:
+            self._request("POST", self.config.trading_base_url, "/fapi/v1/marginType", {
+                "symbol": symbol, "marginType": "ISOLATED",
+            }, signed=True)
+        except BinanceError as exc:
+            if "-4046" not in str(exc) and "No need to change" not in str(exc):
+                raise
+        self._request("POST", self.config.trading_base_url, "/fapi/v1/leverage", {
+            "symbol": symbol, "leverage": "1",
+        }, signed=True)
+        self.ensure_symbol_config(symbol)
+
     def latest_price(self, symbol: str) -> Decimal:
         result = self._request("GET", self.config.market_data_base_url, "/fapi/v1/ticker/price", {"symbol": symbol})
         if not isinstance(result, dict) or "price" not in result:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
@@ -22,6 +23,9 @@ class StateStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA busy_timeout=5000")
+        self.connection.execute("PRAGMA foreign_keys=ON")
         self._migrate()
 
     def close(self) -> None:
@@ -103,6 +107,28 @@ class StateStore:
                     checked_at TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     detail TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS runtime_status (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    reconciled_at TEXT,
+                    last_error TEXT,
+                    available_usdt TEXT,
+                    open_positions INTEGER NOT NULL,
+                    open_units INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS decision_runs (
+                    decision_time TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    universe_size INTEGER,
+                    candidate_count INTEGER,
+                    admission_count INTEGER,
+                    status TEXT NOT NULL,
+                    detail_json TEXT NOT NULL,
+                    error TEXT
                 );
             """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(positions)")}
@@ -242,6 +268,58 @@ class StateStore:
     def record_reconciliation(self, status: str, detail: str) -> None:
         with self.transaction() as connection:
             connection.execute("INSERT INTO reconciliation VALUES (?, ?, ?)", (_utc_now(), status, detail))
+
+    def update_runtime_status(
+        self, version: str, started_at: str, available_usdt: str | None, open_positions: int, open_units: int,
+        *, reconciled: bool = False, error: str | None = None,
+    ) -> None:
+        now = _utc_now()
+        with self.transaction() as connection:
+            current = connection.execute("SELECT reconciled_at FROM runtime_status WHERE singleton = 1").fetchone()
+            reconciled_at = now if reconciled else (current["reconciled_at"] if current else None)
+            connection.execute(
+                """INSERT INTO runtime_status
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                     version = excluded.version, started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at,
+                     reconciled_at = excluded.reconciled_at, last_error = excluded.last_error,
+                     available_usdt = excluded.available_usdt, open_positions = excluded.open_positions,
+                     open_units = excluded.open_units""",
+                (version, started_at, now, reconciled_at, error, available_usdt, open_positions, open_units),
+            )
+
+    def runtime_status(self) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM runtime_status WHERE singleton = 1").fetchone()
+        return dict(row) if row is not None else None
+
+    def start_decision(self, decision_time: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO decision_runs VALUES (?, ?, NULL, NULL, NULL, NULL, 'RUNNING', '{}', NULL)
+                   ON CONFLICT(decision_time) DO NOTHING""",
+                (decision_time, _utc_now()),
+            )
+
+    def finish_decision(
+        self, decision_time: str, universe_size: int, candidates: list[dict[str, Any]], admissions: list[dict[str, Any]],
+        *, error: str | None = None,
+    ) -> None:
+        detail = json.dumps({"candidates": candidates, "admissions": admissions}, default=str, separators=(",", ":"))
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE decision_runs
+                   SET completed_at = ?, universe_size = ?, candidate_count = ?, admission_count = ?,
+                       status = ?, detail_json = ?, error = ?
+                   WHERE decision_time = ?""",
+                (_utc_now(), universe_size, len(candidates), len(admissions), "FAILED" if error else "COMPLETE", detail, error, decision_time),
+            )
+            if cursor.rowcount != 1:
+                raise StateError(f"decision was not started: {decision_time}")
+
+    def recent_decisions(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM decision_runs ORDER BY decision_time DESC LIMIT ?", (limit,)
+        )]
 
     def add_shadow_task(self, shadow_id: str, symbol: str, entry_time: str, planned_exit_time: str) -> None:
         with self.transaction() as connection:

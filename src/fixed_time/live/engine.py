@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING
+import signal
+from threading import Event
 import time
 from typing import Any
 
 import polars as pl
 
+from .. import __version__
 from .binance import BinanceError, BinanceRest, quantize_down, stop_trigger_price
 from .config import LiveConfig
 from .state import StateError, StateStore
@@ -18,9 +21,14 @@ class LiveEngine:
         self.config = config
         self.client = client or BinanceRest(config)
         self.store = store or StateStore(config.database_path)
+        self._stop_requested = Event()
+        self._started_at = self._iso(datetime.now(UTC))
 
     def close(self) -> None:
         self.store.close()
+
+    def request_stop(self) -> None:
+        self._stop_requested.set()
 
     @staticmethod
     def _iso(value: datetime) -> str:
@@ -92,7 +100,7 @@ class LiveEngine:
         if unprotected:
             self.store.record_reconciliation("RECOVERED", f"flattened unprotected positions: {[row['intent_id'] for row in unprotected]}")
             return
-        self.store.record_reconciliation("OK", "exchange and local positions agree")
+        return
 
     def _stop_client_id(self, position: dict[str, Any]) -> str:
         return self._client_id(
@@ -177,7 +185,7 @@ class LiveEngine:
     def _open(self, admission: Admission) -> None:
         row = admission.candidate
         symbol, strategy, position_side = str(row["symbol"]), str(row["strategy"]), str(row["position_side"])
-        self.client.ensure_symbol_config(symbol)
+        self.client.configure_symbol(symbol)
         occupied = self.store.units_open()
         available = self.client.balance()
         notional = unit_notional(available, occupied, admission.units, self.config.strategy)
@@ -224,25 +232,40 @@ class LiveEngine:
         if datetime.now(UTC) > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
             self.store.mark_decision_done(self._iso(decision_time))
             return []
-        self.reconcile()
-        symbols = self.client.tradable_symbols()
-        snapshot = hourly if hourly is not None else self.client.hourly_snapshot(symbols, 30)
-        snapshot = snapshot.filter(pl.col("open_time") < pl.lit(decision_time))
-        if datetime.now(UTC) > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
-            self.store.mark_decision_done(self._iso(decision_time))
-            return []
-        candidates = decision_candidates(snapshot, decision_time, self.config.strategy)
-        for candidate in candidates:
-            if candidate["strategy"] == "long":
-                self.store.add_shadow_task(str(candidate["trade_id"]), str(candidate["symbol"]), self._iso(candidate["entry_time"]), self._iso(candidate["planned_exit_time"]))
-        admissions = plan_admissions(candidates, self.store.open_positions(), self.config.strategy)
-        for admission in admissions:
-            for victim_id in admission.evict_intent_ids:
-                victim = next(row for row in self.store.open_positions() if row["intent_id"] == victim_id)
-                self._close(victim, "LONG_PRIORITY_EVICTION")
-            self._open(admission)
-        self.store.mark_decision_done(self._iso(decision_time))
-        return admissions
+        decision_key = self._iso(decision_time)
+        self.store.start_decision(decision_key)
+        symbols: list[str] = []
+        candidates: list[dict[str, Any]] = []
+        admissions: list[Admission] = []
+        try:
+            self.reconcile()
+            symbols = self.client.tradable_symbols()
+            snapshot = hourly if hourly is not None else self.client.hourly_snapshot(symbols, 30)
+            snapshot = snapshot.filter(pl.col("open_time") < pl.lit(decision_time))
+            if datetime.now(UTC) > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
+                self.store.mark_decision_done(decision_key)
+                self.store.finish_decision(decision_key, len(symbols), candidates, [], error="decision deadline exceeded")
+                return []
+            candidates = decision_candidates(snapshot, decision_time, self.config.strategy)
+            for candidate in candidates:
+                if candidate["strategy"] == "long":
+                    self.store.add_shadow_task(str(candidate["trade_id"]), str(candidate["symbol"]), self._iso(candidate["entry_time"]), self._iso(candidate["planned_exit_time"]))
+            admissions = plan_admissions(candidates, self.store.open_positions(), self.config.strategy)
+            for admission in admissions:
+                for victim_id in admission.evict_intent_ids:
+                    victim = next(row for row in self.store.open_positions() if row["intent_id"] == victim_id)
+                    self._close(victim, "LONG_PRIORITY_EVICTION")
+                self._open(admission)
+            self.store.mark_decision_done(decision_key)
+            self.store.finish_decision(
+                decision_key, len(symbols), candidates,
+                [{"symbol": item.candidate["symbol"], "strategy": item.candidate["strategy"], "units": item.units,
+                  "evicted": list(item.evict_intent_ids)} for item in admissions],
+            )
+            return admissions
+        except Exception as exc:
+            self.store.finish_decision(decision_key, len(symbols), candidates, [], error=str(exc))
+            raise
 
     def process_due_exits(self, now: datetime | None = None) -> None:
         now = now or datetime.now(UTC)
@@ -401,18 +424,52 @@ class LiveEngine:
             raise StateError(f"insufficient P90 warm-up: total={total}, activated={activated}")
         return inserted
 
+    def _heartbeat(self, *, reconciled: bool = False, error: str | None = None) -> None:
+        available = None
+        if error is None:
+            try:
+                available = format(self.client.balance(), "f")
+            except BinanceError:
+                available = None
+        positions = self.store.open_positions()
+        self.store.update_runtime_status(
+            __version__, self._started_at, available, len(positions), self.store.units_open(),
+            reconciled=reconciled, error=error,
+        )
+
     def run_forever(self) -> None:
         self.check()
-        self.reconcile()
         next_reconcile = datetime.now(UTC)
-        while True:
-            now = datetime.now(UTC)
-            if now >= next_reconcile:
-                self.reconcile()
-                self.process_due_exits(now)
-                self.process_long_protection(now)
-                self.process_due_shadows(now)
-                next_reconcile = now + timedelta(seconds=self.config.account_poll_seconds)
-            if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
-                self.process_decision(now.replace(second=0, microsecond=0))
-            time.sleep(1)
+        failures = 0
+        previous_handlers: dict[int, Any] = {}
+        if signal.getsignal(signal.SIGTERM) is not None:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, lambda *_: self.request_stop())
+        try:
+            while not self._stop_requested.is_set():
+                try:
+                    now = datetime.now(UTC)
+                    if now >= next_reconcile:
+                        self.reconcile()
+                        self.process_due_exits(now)
+                        self.process_long_protection(now)
+                        self.process_due_shadows(now)
+                        self._heartbeat(reconciled=True)
+                        next_reconcile = now + timedelta(seconds=self.config.account_poll_seconds)
+                    if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
+                        self.process_decision(now.replace(second=0, microsecond=0))
+                    failures = 0
+                    self._stop_requested.wait(1)
+                except StateError as exc:
+                    self._heartbeat(error=str(exc))
+                    raise
+                except BinanceError as exc:
+                    failures += 1
+                    self._heartbeat(error=str(exc))
+                    if failures >= 5:
+                        raise
+                    self._stop_requested.wait((5, 15, 30)[min(failures - 1, 2)])
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)

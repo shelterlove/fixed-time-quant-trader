@@ -140,6 +140,24 @@ def test_market_post_is_not_retried_after_transport_error(tmp_path: Path) -> Non
     assert len(calls) == 1
 
 
+def test_configure_symbol_sets_isolated_one_x_only_when_needed(tmp_path: Path) -> None:
+    symbol_config_calls = 0
+    paths: list[str] = []
+
+    def transport(_method, url, _params, _headers, _timeout):
+        nonlocal symbol_config_calls
+        paths.append(url)
+        if url.endswith("/symbolConfig"):
+            symbol_config_calls += 1
+            return [{"symbol": "AAAUSDT", "marginType": "crossed" if symbol_config_calls == 1 else "isolated", "leverage": 20 if symbol_config_calls == 1 else 1}]
+        return {"code": 200, "msg": "success"}
+
+    client = BinanceRest(_config(tmp_path), transport=transport)
+    client.configure_symbol("AAAUSDT")
+    assert any(path.endswith("/marginType") for path in paths)
+    assert any(path.endswith("/leverage") for path in paths)
+
+
 class _Client:
     def __init__(self, stop_fails: bool = False):
         self.stop_fails = stop_fails
@@ -147,6 +165,9 @@ class _Client:
 
     def ensure_symbol_config(self, symbol: str) -> None:
         assert symbol == "AAAUSDT"
+
+    def configure_symbol(self, symbol: str) -> None:
+        self.ensure_symbol_config(symbol)
 
     def balance(self) -> Decimal:
         return Decimal("100")

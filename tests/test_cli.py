@@ -37,3 +37,9 @@ def test_live_smoke_requires_explicit_symbol() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["live-smoke"])
     assert parser.parse_args(["live-smoke", "--symbol", "BTCUSDT"]).symbol == "BTCUSDT"
+
+
+def test_live_dashboard_defaults() -> None:
+    parser = _parser()
+    args = parser.parse_args(["live-dashboard"])
+    assert (args.host, args.port) == ("0.0.0.0", 8080)
