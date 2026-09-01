@@ -38,13 +38,20 @@ class LiveEngine:
     def _client_id(prefix: str, strategy: str, symbol: str, when: datetime) -> str:
         return f"ft-{prefix}-{strategy[0]}-{symbol}-{when.strftime('%y%m%d%H%M')}"[:36]
 
+    @staticmethod
+    def _exit_client_id(position: dict[str, Any], sequence: int) -> str:
+        prefix = f"ft-x-{str(position['strategy'])[0]}-"
+        suffix = f"-{datetime.fromisoformat(str(position['decision_time'])).strftime('%y%m%d%H%M')}-{sequence}"
+        symbol_limit = 36 - len(prefix) - len(suffix)
+        return f"{prefix}{str(position['symbol'])[:symbol_limit]}{suffix}"
+
     def check(self) -> dict[str, Any]:
         account = self.client.account_check()
         for position in account["positions"]:
             self.client.ensure_symbol_config(str(position["symbol"]))
         return account
 
-    def reconcile(self) -> None:
+    def reconcile(self, *, full: bool = True) -> None:
         self._recover_pending_entries()
         exchange = {(str(row["symbol"]), str(row["positionSide"])): abs(Decimal(str(row["positionAmt"]))) for row in self.client.positions()}
         local = self.store.open_positions()
@@ -57,17 +64,24 @@ class LiveEngine:
             observed = exchange.get(key, Decimal("0"))
             expected = Decimal(str(position["quantity"]))
             if observed == 0:
-                self.store.close_position(str(position["intent_id"]), "EXCHANGE_CLOSED")
+                completed_exit = self.store.filled_exit_attempt(str(position["intent_id"]))
+                if completed_exit is not None:
+                    self._finalize_exchange_exit(position, str(completed_exit["reason"]))
+                else:
+                    self._record_exchange_stop(position)
                 continue
             if observed != expected:
                 self.store.record_reconciliation("BLOCKED", f"quantity mismatch {key}: exchange={observed} local={expected}")
                 raise StateError(f"quantity mismatch for {key}")
         local = self.store.open_positions()
-        open_orders = self.client.open_orders()
-        if open_orders:
-            self.store.record_reconciliation("BLOCKED", "unexpected open normal orders")
-            raise StateError("unexpected open normal orders")
-        algo_orders = self.client.open_algo_orders()
+        if not full and not local:
+            return
+        if full:
+            open_orders = self.client.open_orders()
+            if open_orders:
+                self.store.record_reconciliation("BLOCKED", "unexpected open normal orders")
+                raise StateError("unexpected open normal orders")
+        algo_orders = self._tracked_algo_orders(local, full)
         algo_by_client_id = {
             str(row["clientAlgoId"]): str(row["algoId"])
             for row in algo_orders if row.get("clientAlgoId") and row.get("algoId")
@@ -90,10 +104,12 @@ class LiveEngine:
         if unknown_algos:
             self.store.record_reconciliation("BLOCKED", f"unknown algo orders: {sorted(unknown_algos)}")
             raise StateError(f"unknown algo orders: {sorted(unknown_algos)}")
-        for position in (row for row in local if not row.get("stop_algo_id")):
+        missing_stops = [row for row in local if not row.get("stop_algo_id")]
+        for position in missing_stops:
             self._install_stop(position)
         local = self.store.open_positions()
-        algo_ids = {str(row.get("algoId")) for row in self.client.open_algo_orders()}
+        protected_algos = self._tracked_algo_orders(local, full) if missing_stops else algo_orders
+        algo_ids = {str(row.get("algoId")) for row in protected_algos}
         unprotected = [row for row in local if not row.get("stop_algo_id") or str(row["stop_algo_id"]) not in algo_ids]
         for position in unprotected:
             self._close(position, "UNPROTECTED_RECOVERY")
@@ -101,6 +117,48 @@ class LiveEngine:
             self.store.record_reconciliation("RECOVERED", f"flattened unprotected positions: {[row['intent_id'] for row in unprotected]}")
             return
         return
+
+    def _tracked_algo_orders(self, positions: list[dict[str, Any]], full: bool) -> list[dict[str, Any]]:
+        if full:
+            return self.client.open_algo_orders()
+        return [
+            order
+            for symbol in sorted({str(position["symbol"]) for position in positions})
+            for order in self.client.open_algo_orders(symbol)
+        ]
+
+    def _finalize_exchange_exit(self, position: dict[str, Any], reason: str) -> None:
+        if position.get("stop_algo_id"):
+            try:
+                self.client.cancel_algo(str(position["symbol"]), str(position["stop_algo_id"]))
+            except BinanceError:
+                # A stop that has just triggered or been cancelled is already inactive.
+                pass
+        self.store.close_position(str(position["intent_id"]), reason)
+
+    def _record_exchange_stop(self, position: dict[str, Any]) -> None:
+        algo_id = position.get("stop_algo_id")
+        if not algo_id:
+            message = f"exchange closed unprotected position {position['intent_id']}"
+            self.store.record_reconciliation("BLOCKED", message)
+            raise StateError(message)
+        try:
+            algo = self.client.query_algo_by_id(str(position["symbol"]), str(algo_id))
+            actual_order_id = str(algo.get("actualOrderId", ""))
+            if not actual_order_id or actual_order_id == "0":
+                raise StateError(f"stop {algo_id} has no actual order")
+            response = self.client.query_order_by_id(str(position["symbol"]), actual_order_id)
+            executed = Decimal(str(response.get("executedQty", "0")))
+            if executed <= 0:
+                raise StateError(f"stop {algo_id} actual order has no fill")
+            response = self._with_average_price_by_id(str(position["symbol"]), actual_order_id, response)
+            client_order_id = str(response.get("clientOrderId") or f"ft-a-{algo_id}")
+            self.store.record_execution(str(position["intent_id"]), client_order_id, "EXIT", response, "EXCHANGE_STOP")
+            self._finalize_exchange_exit(position, "EXCHANGE_STOP")
+        except (BinanceError, StateError) as exc:
+            message = f"cannot reconcile exchange stop for {position['intent_id']}: {exc}"
+            self.store.record_reconciliation("BLOCKED", message)
+            raise StateError(message) from exc
 
     def _stop_client_id(self, position: dict[str, Any]) -> str:
         return self._client_id(
@@ -153,34 +211,47 @@ class LiveEngine:
         return "SELL" if opening else "BUY"
 
     def _close(self, position: dict[str, Any], reason: str) -> None:
-        entry_id = str(position["entry_client_order_id"])
-        order_id = entry_id.replace("ft-e-", "ft-x-", 1)
-        try:
-            response = self.client.market_order(
-                str(position["symbol"]), self._side(str(position["strategy"]), False), str(position["position_side"]),
-                Decimal(str(position["quantity"])), order_id,
-            )
-        except BinanceError as exc:
-            try:
-                response = self.client.query_order(str(position["symbol"]), order_id)
-            except BinanceError:
-                raise exc
-        executed = Decimal(str(response.get("executedQty", "0")))
         requested = Decimal(str(position["quantity"]))
+        sequence = self.store.next_exit_sequence(str(position["intent_id"]))
+        attempt = self.store.begin_exit_attempt(
+            str(position["intent_id"]), format(requested, "f"), reason, self._exit_client_id(position, sequence),
+        )
+        order_id = str(attempt["client_order_id"])
+        if str(attempt["status"]) == "FILLED":
+            self._confirm_filled_exit(position, str(attempt["reason"]))
+            return
+        if Decimal(str(attempt["requested_quantity"])) != requested:
+            raise StateError(f"exit attempt quantity does not match local position: {position['intent_id']}")
+        response = self._market_or_query(
+            str(position["symbol"]), self._side(str(position["strategy"]), False), str(position["position_side"]), requested, order_id,
+        )
+        executed = Decimal(str(response.get("executedQty", "0")))
+        if executed < 0 or executed > requested:
+            raise StateError(f"invalid exit quantity for {position['intent_id']}: {executed}")
         if executed > 0:
             response = self._with_average_price(str(position["symbol"]), order_id, response)
-        self.store.record_execution(str(position["intent_id"]), order_id, "EXIT", response, reason)
-        if executed != requested:
-            if executed > 0:
-                self.store.update_position_quantity(str(position["intent_id"]), format(requested - executed, "f"))
-            raise BinanceError(f"{reason} exit did not fully fill {position['intent_id']}")
-        if position.get("stop_algo_id"):
-            try:
-                self.client.cancel_algo(str(position["symbol"]), str(position["stop_algo_id"]))
-            except BinanceError:
-                # A simultaneously triggered stop is benign; reconciliation will establish the final state.
-                pass
-        self.store.close_position(str(position["intent_id"]), reason)
+        self.store.record_execution(str(position["intent_id"]), order_id, "EXIT", response, str(attempt["reason"]))
+        if executed == requested:
+            self.store.finish_exit_attempt(order_id, "FILLED")
+            self._confirm_filled_exit(position, str(attempt["reason"]))
+            return
+        self.store.finish_exit_attempt(order_id, "PARTIAL" if executed > 0 else "NO_FILL")
+        if executed > 0:
+            self.store.update_position_quantity(str(position["intent_id"]), format(requested - executed, "f"))
+        raise BinanceError(f"{reason} exit did not fully fill {position['intent_id']}")
+
+    def _confirm_filled_exit(self, position: dict[str, Any], reason: str) -> None:
+        key = (str(position["symbol"]), str(position["position_side"]))
+        exchange = {
+            (str(row["symbol"]), str(row["positionSide"])): abs(Decimal(str(row["positionAmt"])))
+            for row in self.client.positions()
+        }
+        remaining = exchange.get(key, Decimal("0"))
+        if remaining != 0:
+            message = f"filled exit still has exchange position {key}: {remaining}"
+            self.store.record_reconciliation("BLOCKED", message)
+            raise StateError(message)
+        self._finalize_exchange_exit(position, reason)
 
     def _open(self, admission: Admission) -> None:
         row = admission.candidate
@@ -395,6 +466,14 @@ class LiveEngine:
             raise BinanceError(f"filled order has no average price: {client_order_id}")
         return authoritative
 
+    def _with_average_price_by_id(self, symbol: str, order_id: str, response: dict[str, Any]) -> dict[str, Any]:
+        if Decimal(str(response.get("avgPrice", "0"))) > 0:
+            return response
+        authoritative = self.client.query_order_by_id(symbol, order_id)
+        if Decimal(str(authoritative.get("avgPrice", "0"))) <= 0:
+            raise BinanceError(f"filled order has no average price: {order_id}")
+        return authoritative
+
     def seed_shadow_history(self, cutoff: datetime | None = None) -> int:
         cutoff = cutoff or datetime.now(UTC)
         earliest = cutoff - timedelta(days=self.config.strategy.values["long"]["protection"]["window_days"])
@@ -417,23 +496,20 @@ class LiveEngine:
                     records.append((source_id, self._iso(exit_time), bool(row["shadow_activated"]), row["shadow_max_retrace"]))
         if not records:
             path = self.config.root / "seed" / "initial_shadow_history.csv"
-            if not path.exists():
-                raise StateError("no local shadow history is available for P90 warm-up")
-            frame = pl.read_csv(path, try_parse_dates=True)
-            required = {"shadow_exit_time", "shadow_activated", "shadow_max_retrace"}
-            if not required.issubset(frame.columns):
-                raise StateError(f"{path} cannot seed P90 history")
-            for index, row in enumerate(frame.select(*required).drop_nulls("shadow_exit_time").to_dicts()):
-                exit_time = row["shadow_exit_time"]
-                if not isinstance(exit_time, datetime):
-                    exit_time = datetime.fromisoformat(str(exit_time))
-                exit_time = exit_time.astimezone(UTC)
-                if earliest <= exit_time <= cutoff:
-                    records.append((f"seed:initial:{index}", self._iso(exit_time), bool(row["shadow_activated"]), row["shadow_max_retrace"]))
-        if not records:
-            raise StateError("no local shadow history is available for P90 warm-up")
-        inserted = self.store.seed_shadow_history(records)
+            if path.exists():
+                frame = pl.read_csv(path, try_parse_dates=True)
+                required = {"shadow_exit_time", "shadow_activated", "shadow_max_retrace"}
+                if not required.issubset(frame.columns):
+                    raise StateError(f"{path} cannot seed P90 history")
+                for index, row in enumerate(frame.select(*required).drop_nulls("shadow_exit_time").to_dicts()):
+                    exit_time = row["shadow_exit_time"]
+                    if not isinstance(exit_time, datetime):
+                        exit_time = datetime.fromisoformat(str(exit_time))
+                    exit_time = exit_time.astimezone(UTC)
+                    if earliest <= exit_time <= cutoff:
+                        records.append((f"seed:initial:{index}", self._iso(exit_time), bool(row["shadow_activated"]), row["shadow_max_retrace"]))
         self.store.prune_shadow_history(self._iso(earliest))
+        inserted = self.store.seed_shadow_history(records) if records else 0
         total, activated = self.store.shadow_history_stats()
         rules = self.config.strategy.values["long"]["protection"]
         if total < rules["minimum_history"] or activated < rules["minimum_activated_history"]:
@@ -455,7 +531,8 @@ class LiveEngine:
 
     def run_forever(self) -> None:
         self.check()
-        next_reconcile = datetime.now(UTC)
+        next_poll = datetime.now(UTC)
+        next_full_reconcile = next_poll
         failures = 0
         previous_handlers: dict[int, Any] = {}
         if signal.getsignal(signal.SIGTERM) is not None:
@@ -466,15 +543,19 @@ class LiveEngine:
             while not self._stop_requested.is_set():
                 try:
                     now = datetime.now(UTC)
-                    if now >= next_reconcile:
-                        self.reconcile()
+                    if now >= next_poll:
+                        full_reconcile = now >= next_full_reconcile
+                        self.reconcile(full=full_reconcile)
                         self.process_due_exits(now)
                         self.process_long_protection(now)
                         self.process_due_shadows(now)
-                        self._heartbeat(reconciled=True)
-                        next_reconcile = now + timedelta(seconds=self.config.account_poll_seconds)
+                        self._heartbeat(reconciled=full_reconcile)
+                        next_poll = now + timedelta(seconds=self.config.account_poll_seconds)
+                        if full_reconcile:
+                            next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
                     if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
                         self.process_decision(now.replace(second=0, microsecond=0))
+                        next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
                     failures = 0
                     self._stop_requested.wait(1)
                 except StateError as exc:

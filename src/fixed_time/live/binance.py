@@ -210,14 +210,16 @@ class BinanceRest:
             raise BinanceError(f"invalid ticker price for {symbol}")
         return price
 
-    def open_orders(self) -> list[dict[str, Any]]:
-        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/openOrders", signed=True)
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params = {"symbol": symbol} if symbol is not None else None
+        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/openOrders", params, signed=True)
         if not isinstance(result, list):
             raise BinanceError("invalid open orders response")
         return result
 
-    def open_algo_orders(self) -> list[dict[str, Any]]:
-        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/openAlgoOrders", signed=True)
+    def open_algo_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params = {"symbol": symbol} if symbol is not None else None
+        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/openAlgoOrders", params, signed=True)
         if not isinstance(result, list):
             raise BinanceError("invalid open algo orders response")
         return result
@@ -244,6 +246,12 @@ class BinanceRest:
             raise BinanceError("invalid order response")
         return result
 
+    def query_order_by_id(self, symbol: str, order_id: str) -> dict[str, Any]:
+        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True)
+        if not isinstance(result, dict):
+            raise BinanceError("invalid order response")
+        return result
+
     def stop_market(self, symbol: str, side: str, position_side: str, trigger_price: Decimal, client_algo_id: str) -> dict[str, Any]:
         if not self.config.trading_enabled:
             raise BinanceError("TRADING_ENABLED is false")
@@ -258,6 +266,12 @@ class BinanceRest:
 
     def query_algo(self, symbol: str, client_algo_id: str) -> dict[str, Any]:
         result = self._request("GET", self.config.trading_base_url, "/fapi/v1/algoOrder", {"symbol": symbol, "clientAlgoId": client_algo_id}, signed=True)
+        if not isinstance(result, dict):
+            raise BinanceError("invalid algo order response")
+        return result
+
+    def query_algo_by_id(self, symbol: str, algo_id: str) -> dict[str, Any]:
+        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id}, signed=True)
         if not isinstance(result, dict):
             raise BinanceError("invalid algo order response")
         return result

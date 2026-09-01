@@ -16,6 +16,16 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _exchange_time(response: dict[str, Any]) -> str | None:
+    value = response.get("updateTime", response.get("transactTime", response.get("time")))
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, UTC).isoformat()
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
 class StateStore:
     """Small durable ledger. Exchange data remains the source of trade truth."""
 
@@ -84,7 +94,19 @@ class StateStore:
                     status TEXT NOT NULL,
                     quantity TEXT NOT NULL,
                     average_price TEXT NOT NULL,
+                    executed_at TEXT,
                     recorded_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS exit_attempts (
+                    client_order_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+                    sequence INTEGER NOT NULL,
+                    requested_quantity TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(intent_id, sequence)
                 );
                 CREATE TABLE IF NOT EXISTS shadow_history (
                     source_id TEXT PRIMARY KEY,
@@ -140,6 +162,9 @@ class StateStore:
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE positions ADD COLUMN {name} {declaration}")
+            execution_columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
+            if "executed_at" not in execution_columns:
+                connection.execute("ALTER TABLE executions ADD COLUMN executed_at TEXT")
             history_columns = {row[1] for row in connection.execute("PRAGMA table_info(shadow_history)")}
             if "source_id" not in history_columns:
                 connection.execute("ALTER TABLE shadow_history RENAME TO shadow_history_legacy")
@@ -177,12 +202,63 @@ class StateStore:
     def record_execution(self, intent_id: str, client_order_id: str, role: str, response: dict[str, Any], reason: str | None = None) -> None:
         with self.transaction() as connection:
             connection.execute(
-                """INSERT OR REPLACE INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO executions
+                   (client_order_id, intent_id, role, reason, exchange_order_id, status, quantity, average_price, executed_at, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     client_order_id, intent_id, role, reason, str(response.get("orderId", "")), str(response.get("status", "UNKNOWN")),
-                    str(response.get("executedQty", "0")), str(response.get("avgPrice", "0")), _utc_now(),
+                    str(response.get("executedQty", "0")), str(response.get("avgPrice", "0")), _exchange_time(response), _utc_now(),
                 ),
             )
+
+    def begin_exit_attempt(self, intent_id: str, requested_quantity: str, reason: str, client_order_id: str) -> dict[str, Any]:
+        """Persist an idempotency key before a close order can reach Binance."""
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """SELECT * FROM exit_attempts
+                   WHERE intent_id = ? AND status IN ('SUBMITTED', 'FILLED')
+                   ORDER BY sequence DESC LIMIT 1""",
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            sequence = int(connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM exit_attempts WHERE intent_id = ?", (intent_id,)
+            ).fetchone()["value"])
+            now = _utc_now()
+            connection.execute(
+                "INSERT INTO exit_attempts VALUES (?, ?, ?, ?, ?, 'SUBMITTED', ?, ?)",
+                (client_order_id, intent_id, sequence, requested_quantity, reason, now, now),
+            )
+            row = connection.execute("SELECT * FROM exit_attempts WHERE client_order_id = ?", (client_order_id,)).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def next_exit_sequence(self, intent_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM exit_attempts WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        return int(row["value"])
+
+    def finish_exit_attempt(self, client_order_id: str, status: str) -> None:
+        if status not in {"PARTIAL", "NO_FILL", "FILLED", "SETTLED"}:
+            raise StateError(f"invalid exit attempt status: {status}")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE exit_attempts SET status = ?, updated_at = ? WHERE client_order_id = ?",
+                (status, _utc_now(), client_order_id),
+            )
+            if cursor.rowcount != 1:
+                raise StateError(f"unknown exit attempt {client_order_id}")
+
+    def filled_exit_attempt(self, intent_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT * FROM exit_attempts
+               WHERE intent_id = ? AND status = 'FILLED'
+               ORDER BY sequence DESC LIMIT 1""",
+            (intent_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def open_position(self, intent_id: str, quantity: str, entry_price: str, allowed_retrace: float | None = None, stop_algo_id: str | None = None) -> None:
         intent = self.intent(intent_id)
@@ -250,6 +326,10 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise StateError(f"cannot close {intent_id}")
             connection.execute("UPDATE intents SET status = ?, updated_at = ? WHERE intent_id = ?", (status, _utc_now(), intent_id))
+            connection.execute(
+                "UPDATE exit_attempts SET status = 'SETTLED', updated_at = ? WHERE intent_id = ? AND status = 'FILLED'",
+                (_utc_now(), intent_id),
+            )
 
     def units_open(self, strategy: str | None = None) -> int:
         query, params = "SELECT COALESCE(SUM(units), 0) AS value FROM positions WHERE status = 'OPEN'", ()

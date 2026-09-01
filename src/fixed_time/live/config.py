@@ -23,6 +23,7 @@ class LiveConfig:
     trading_enabled: bool
     database_path: Path
     account_poll_seconds: int
+    idle_reconcile_seconds: int
     decision_deadline_seconds: int
     request_timeout_seconds: int
     max_attempts: int
@@ -84,7 +85,7 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         raise ConfigError("testnet environment URLs are fixed; signed production trading is not supported")
     if account != {"position_mode": "hedge", "margin_type": "isolated", "leverage": 1, "single_asset_mode": True}:
         raise ConfigError("only hedge, isolated, single-asset, 1x testnet execution is supported")
-    required_runtime = {"account_poll_seconds", "decision_deadline_seconds", "request_timeout_seconds", "max_attempts", "max_concurrent_market_requests"}
+    required_runtime = {"account_poll_seconds", "idle_reconcile_seconds", "decision_deadline_seconds", "request_timeout_seconds", "max_attempts", "max_concurrent_market_requests"}
     if set(runtime) != required_runtime or not all(isinstance(runtime[name], int) and runtime[name] > 0 for name in required_runtime):
         raise ConfigError("runtime settings must be positive integers")
     dotenv = _load_dotenv(root_path / ".env")
@@ -107,6 +108,7 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         trading_enabled=enabled,
         database_path=(root_path / database).resolve(),
         account_poll_seconds=poll_seconds,
+        idle_reconcile_seconds=runtime["idle_reconcile_seconds"],
         decision_deadline_seconds=runtime["decision_deadline_seconds"],
         request_timeout_seconds=runtime["request_timeout_seconds"],
         max_attempts=runtime["max_attempts"],

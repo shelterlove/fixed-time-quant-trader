@@ -13,6 +13,7 @@ single_asset_mode = true
 
 [runtime]
 account_poll_seconds = 5
+idle_reconcile_seconds = 60
 decision_deadline_seconds = 60
 request_timeout_seconds = 10
 max_attempts = 3
