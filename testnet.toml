@@ -2,7 +2,7 @@
 # live/testnet execution profile without mutating the frozen research strategy.
 [environment]
 market_data_base_url = "https://fapi.binance.com"
-trading_base_url = "https://testnet.binancefuture.com"
+trading_base_url = "https://demo-fapi.binance.com"
 trading_environment = "testnet"
 
 [account]

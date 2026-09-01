@@ -66,6 +66,7 @@ class StateStore:
                     protection_active INTEGER NOT NULL DEFAULT 0,
                     protection_peak TEXT,
                     protection_allowed_retrace REAL,
+                    protection_last_bar_time TEXT,
                     status TEXT NOT NULL,
                     opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -109,6 +110,7 @@ class StateStore:
                 ("protection_active", "INTEGER NOT NULL DEFAULT 0"),
                 ("protection_peak", "TEXT"),
                 ("protection_allowed_retrace", "REAL"),
+                ("protection_last_bar_time", "TEXT"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE positions ADD COLUMN {name} {declaration}")
@@ -178,11 +180,13 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise StateError(f"cannot add stop to {intent_id}")
 
-    def update_protection(self, intent_id: str, active: bool, peak: str) -> None:
+    def update_protection(self, intent_id: str, active: bool, peak: str, last_bar_time: str) -> None:
         with self.transaction() as connection:
             cursor = connection.execute(
-                "UPDATE positions SET protection_active = ?, protection_peak = ?, updated_at = ? WHERE intent_id = ? AND status = 'OPEN'",
-                (int(active), peak, _utc_now(), intent_id),
+                """UPDATE positions
+                   SET protection_active = ?, protection_peak = ?, protection_last_bar_time = ?, updated_at = ?
+                   WHERE intent_id = ? AND status = 'OPEN'""",
+                (int(active), peak, last_bar_time, _utc_now(), intent_id),
             )
             if cursor.rowcount != 1:
                 raise StateError(f"cannot update protection for {intent_id}")
@@ -202,6 +206,17 @@ class StateStore:
                FROM positions JOIN intents USING(intent_id)
                WHERE positions.status = 'OPEN' ORDER BY opened_at"""
         )]
+
+    def pending_intents(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM intents WHERE status = 'PENDING' ORDER BY created_at"
+        )]
+
+    def known_stop_ids(self) -> set[str]:
+        return {
+            str(row["stop_algo_id"])
+            for row in self.connection.execute("SELECT stop_algo_id FROM positions WHERE stop_algo_id IS NOT NULL")
+        }
 
     def close_position(self, intent_id: str, status: str = "CLOSED") -> None:
         with self.transaction() as connection:

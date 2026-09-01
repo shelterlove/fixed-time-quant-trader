@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import polars as pl
 
 from fixed_time.config import load_config
 from fixed_time.live.binance import BinanceError, BinanceRest, quantize_down, stop_trigger_price
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _config(tmp_path: Path) -> LiveConfig:
     return LiveConfig(
         root=ROOT, strategy=load_config(ROOT), market_data_base_url="https://fapi.binance.com",
-        trading_base_url="https://testnet.binancefuture.com", api_key="key", api_secret="secret", trading_enabled=True,
+        trading_base_url="https://demo-fapi.binance.com", api_key="key", api_secret="secret", trading_enabled=True,
         database_path=tmp_path / "runtime.sqlite3", account_poll_seconds=5, decision_deadline_seconds=60,
         request_timeout_seconds=1, max_attempts=3, max_concurrent_market_requests=1,
     )
@@ -50,7 +51,7 @@ def test_live_config_defaults_to_disabled(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "state.sqlite3"))
     config = load_live_config(ROOT)
     assert config.trading_enabled is False
-    assert config.trading_base_url == "https://testnet.binancefuture.com"
+    assert config.trading_base_url == "https://demo-fapi.binance.com"
 
 
 def test_state_preserves_logical_units(tmp_path: Path) -> None:
@@ -172,6 +173,64 @@ class _Client:
         return None
 
 
+class _RecoveryClient(_Client):
+    def __init__(self, order: dict | None = None):
+        super().__init__()
+        self.order = order
+        self.exchange_positions: list[dict] = []
+        self.algo_orders: list[dict] = []
+        self.stop_calls = 0
+
+    def query_order(self, *_args) -> dict:
+        if self.order is None:
+            raise BinanceError("not found")
+        return self.order
+
+    def positions(self) -> list[dict]:
+        return self.exchange_positions
+
+    def open_orders(self) -> list[dict]:
+        return []
+
+    def open_algo_orders(self) -> list[dict]:
+        return list(self.algo_orders)
+
+    def stop_market(self, symbol: str, _side: str, _position_side: str, _trigger: Decimal, client_algo_id: str) -> dict:
+        self.stop_calls += 1
+        self.algo_orders.append({"algoId": "recovered-stop", "clientAlgoId": client_algo_id, "symbol": symbol})
+        return {"algoId": "recovered-stop"}
+
+
+class _ProtectionClient(_Client):
+    def __init__(self, bar_time: datetime):
+        super().__init__()
+        self.bar_time = bar_time
+
+    def klines(self, _symbol: str, _interval: str, _limit: int) -> pl.DataFrame:
+        return pl.DataFrame([{
+            "symbol": "AAAUSDT", "open_time": self.bar_time, "open": 100., "high": 130., "low": 100., "close": 120.,
+            "quote_volume": 1., "trade_count": 1,
+        }])
+
+
+class _SmokeFailureClient(_Client):
+    def __init__(self):
+        super().__init__()
+        self.cancelled: list[str] = []
+        self.sell_attempts = 0
+
+    def market_order(self, symbol: str, side: str, position_side: str, quantity: Decimal, client_order_id: str) -> dict:
+        self.orders.append((symbol, side, position_side, quantity))
+        if side == "SELL":
+            self.sell_attempts += 1
+            if self.sell_attempts == 1:
+                return {"status": "NEW", "executedQty": "0", "avgPrice": "0"}
+        return {"status": "FILLED", "executedQty": format(quantity, "f"), "avgPrice": "100"}
+
+    def cancel_algo(self, _symbol: str, algo_id: str) -> None:
+        self.cancelled.append(algo_id)
+
+
 def test_entry_creates_exchange_stop_and_persistent_position(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = StateStore(tmp_path / "state.sqlite3")
@@ -195,3 +254,61 @@ def test_stop_setup_failure_flattens_filled_entry(tmp_path: Path) -> None:
         engine._open(Admission(_candidate("long", "AAAUSDT", time), 2))
     assert store.open_positions() == []
     assert [(side, position_side) for _, side, position_side, _ in client.orders] == [("BUY", "LONG"), ("SELL", "LONG")]
+
+
+def test_reconcile_recovers_pending_filled_entry_and_installs_stop(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC).isoformat()
+    store.create_intent({"intent_id": "pending", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time,
+                         "planned_exit_time": time, "units": 1, "priority_score": 1.0, "client_order_id": "ft-e-l-AAAUSDT-2609011400"})
+    client = _RecoveryClient({"orderId": "1", "status": "FILLED", "executedQty": ".1", "avgPrice": "100"})
+    client.exchange_positions = [{"symbol": "AAAUSDT", "positionSide": "LONG", "positionAmt": ".1"}]
+    engine = LiveEngine(config, client=client, store=store)
+    engine.reconcile()
+    position = store.open_positions()[0]
+    assert position["quantity"] == "0.1"
+    assert position["stop_algo_id"] == "recovered-stop"
+    assert client.stop_calls == 1
+
+
+def test_reconcile_adopts_exchange_stop_created_before_local_persistence(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "open", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time.isoformat(),
+                         "planned_exit_time": time.isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "ft-e-l-AAAUSDT-2609011400"})
+    store.open_position("open", ".1", "100", .3)
+    client = _RecoveryClient()
+    client.exchange_positions = [{"symbol": "AAAUSDT", "positionSide": "LONG", "positionAmt": ".1"}]
+    engine = LiveEngine(config, client=client, store=store)
+    client.algo_orders = [{"algoId": "existing-stop", "clientAlgoId": engine._stop_client_id(store.open_positions()[0]), "symbol": "AAAUSDT"}]
+    engine.reconcile()
+    assert store.open_positions()[0]["stop_algo_id"] == "existing-stop"
+    assert client.stop_calls == 0
+
+
+def test_long_protection_does_not_reprocess_activation_bar_after_restart(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "open", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time.isoformat(),
+                         "planned_exit_time": (time + timedelta(hours=1)).isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "ft-e-l-AAAUSDT-2609011400"})
+    store.open_position("open", ".1", "100", .1, "stop")
+    bar_time = time + timedelta(minutes=1)
+    client = _ProtectionClient(bar_time)
+    LiveEngine(config, client=client, store=store).process_long_protection(bar_time + timedelta(minutes=1))
+    assert store.open_positions()[0]["protection_last_bar_time"] == bar_time.isoformat()
+    LiveEngine(config, client=client, store=store).process_long_protection(bar_time + timedelta(minutes=1))
+    assert client.orders == []
+
+
+def test_smoke_failure_retries_same_exit_and_cancels_stop_after_cleanup(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    client = _SmokeFailureClient()
+    engine = LiveEngine(config, client=client, store=StateStore(tmp_path / "state.sqlite3"))
+    engine.check = lambda: {"positions": [], "open_orders": [], "open_algo_orders": []}  # type: ignore[method-assign]
+    with pytest.raises(BinanceError, match="smoke exit did not fill"):
+        engine.smoke_test("AAAUSDT")
+    assert client.sell_attempts == 2
+    assert client.cancelled == ["99"]

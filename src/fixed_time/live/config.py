@@ -9,7 +9,7 @@ from ..config import ConfigError, StrategyConfig, load_config
 
 
 PUBLIC_FUTURES_URL = "https://fapi.binance.com"
-TESTNET_FUTURES_URL = "https://testnet.binancefuture.com"
+TESTNET_FUTURES_URL = "https://demo-fapi.binance.com"
 
 
 @dataclass(frozen=True)
