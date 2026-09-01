@@ -88,3 +88,14 @@ def test_config_rejects_unimplemented_funding_semantics() -> None:
     values["long"]["funding_boundary"] = "different_boundary"
     with pytest.raises(ConfigError, match="funding semantics"):
         _validate(values)
+
+
+def test_config_rejects_invalid_short_rank_and_units() -> None:
+    values = deepcopy(load_config().values)
+    values["short"]["r24_rank_min"] = 0
+    with pytest.raises(ConfigError, match="rank range"):
+        _validate(values)
+    values = deepcopy(load_config().values)
+    values["short"]["portfolio"]["units_per_signal"] = 0
+    with pytest.raises(ConfigError, match="units_per_signal"):
+        _validate(values)

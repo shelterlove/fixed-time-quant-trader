@@ -137,7 +137,11 @@ def _validate(values: dict[str, Any]) -> dict[str, Window]:
     _require(long["entry_hours_utc"] == [14, 15, 17] and short["entry_hours_utc"] == [6, 8], "unsupported entry-hour layout")
     _require(features["strategy_decision_hours_utc"] == [6, 8, 14, 15, 17] and features["rank_history_hours_utc"] == [2, 4], "unsupported decision/history-hour layout")
     _require(long["rank_factors"] == ["r1", "r4", "r24", "v1", "v4"], "unsupported long rank factors")
-    _require(all(1 <= value <= universe["top_n"] for value in [long["rank_max"], short["r24_rank_max"], short["r4_rank_change_rank_max"], short["volume_diff_rank_max"]]), "rank range exceeds Top100")
+    _require(all(1 <= value <= universe["top_n"] for value in [
+        long["rank_max"], short["r24_rank_min"], short["r24_rank_max"],
+        short["r4_rank_change_rank_min"], short["r4_rank_change_rank_max"],
+        short["volume_diff_rank_min"], short["volume_diff_rank_max"],
+    ]), "rank range exceeds Top100")
     _require(short["r24_rank_min"] <= short["r24_rank_max"] and short["r4_rank_change_rank_min"] <= short["r4_rank_change_rank_max"] and short["volume_diff_rank_min"] <= short["volume_diff_rank_max"], "invalid short rank range")
     _require(-1 < long["hard_stop_return"] < 0 and long["slippage_per_side"] >= 0 and long["taker_fee_per_side"] >= 0, "invalid long execution parameter")
     _require(short["hard_stop_return"] > 0 and short["round_trip_stress_cost"] >= 0, "invalid short execution parameter")
@@ -158,6 +162,7 @@ def _validate(values: dict[str, Any]) -> dict[str, Window]:
     _require(0 < long["portfolio"]["max_positions_per_entry_time"] <= long["portfolio"]["total_units"], "invalid long entry-slot capacity")
     _require(0 < long["portfolio"]["two_signal_units_each"] <= long["portfolio"]["single_signal_units"] <= long["portfolio"]["total_units"], "invalid long requested units")
     _require(0 < short["portfolio"]["max_positions_per_entry_hour"] <= short["portfolio"]["total_daily_units"], "invalid short entry-hour capacity")
+    _require(short["portfolio"]["units_per_signal"] == 1, "short units_per_signal must remain 1")
     _require(long["portfolio"]["total_units"] == portfolio["total_units"] == portfolio["long_unit_cap"], "long/combined unit capacities disagree")
     _require(short["portfolio"]["total_daily_units"] == portfolio["short_unit_cap"], "short/combined unit capacities disagree")
     _require(short["portfolio"]["selection"] == "SEQUENTIAL_06_THEN_08" and short["portfolio"]["same_symbol_same_day"] == "allow_in_standalone", "unsupported short portfolio semantics")

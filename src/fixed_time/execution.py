@@ -239,7 +239,8 @@ def execute_long_with_funding_diagnostics(
         })
         completed.append((base_path.exit_time, base_path.activated, base_path.max_retrace))
     diagnostics = pl.DataFrame(funding_events).select(FUNDING_EVENT_COLUMNS).sort(["entry_time", "funding_time"]) if funding_events else pl.DataFrame(schema={name: pl.Null for name in FUNDING_EVENT_COLUMNS})
-    return pl.DataFrame(rows).select(TRADE_COLUMNS).sort("entry_time"), diagnostics
+    trades = pl.DataFrame(rows).select(TRADE_COLUMNS).sort("entry_time") if rows else pl.DataFrame(schema={name: pl.Null for name in TRADE_COLUMNS})
+    return trades, diagnostics
 
 
 def execute_short(signals: pl.DataFrame, hourly: pl.DataFrame, config: StrategyConfig) -> pl.DataFrame:
@@ -272,7 +273,8 @@ def execute_short(signals: pl.DataFrame, hourly: pl.DataFrame, config: StrategyC
         rows.append({
             "trade_id": signal["trade_id"], "strategy": "short", "symbol": symbol, "signal_time": signal["decision_time"],
             "entry_time": entry, "planned_exit_time": planned, "exit_time": outcome_time, "entry_reference": entry_reference,
-            "exit_reference": outcome_reference, "exit_reason": reason, "units": 1, "notional": 1.0,
+            "exit_reference": outcome_reference, "exit_reason": reason,
+            "units": signal.get("requested_units", rules["portfolio"]["units_per_signal"]), "notional": 1.0,
             "visible_hourly_close": entry_reference,
             "gross_return": gross, "cost_return": cost, "funding_return": 0.0, "net_return": gross + cost, "pnl": gross + cost,
             "mae_return": entry_reference / max(highs) - 1, "mfe_return": entry_reference / min(lows) - 1,

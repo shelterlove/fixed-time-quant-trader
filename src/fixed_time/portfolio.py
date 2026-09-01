@@ -168,12 +168,13 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
                 continue
             occupied = sum(int(position["units"]) for position in positions.values())
             short_units = sum(int(position["units"]) for position in positions.values() if position["strategy"] == "short")
-            if occupied >= rules["total_units"] or short_units >= rules["short_unit_cap"]:
+            requested = int(row["units"])
+            if occupied + requested > rules["total_units"] or short_units + requested > rules["short_unit_cap"]:
                 counts["SHORT_SKIP_NO_FUNDS"] += 1
                 audit_row(row, "SHORT_SKIP_NO_FUNDS", successful_longs, before)
                 continue
             free_units = rules["total_units"] - occupied
-            position = dict(row, units=1, notional=cash / free_units)
+            position = dict(row, units=requested, notional=requested * cash / free_units)
             positions[key] = position
             cash -= position["notional"]
             audit_row(row, "SELECTED", successful_longs, before)

@@ -15,7 +15,7 @@ from .features import build_features
 from .metrics import report_markdown, summarize
 from .portfolio import replay_long_standalone, replay_portfolio, replay_short_standalone
 from .signals import enforce_research_subwindow_exit_boundary, long_signals, short_signals
-from .storage import atomic_write_frame, atomic_write_json, atomic_write_text, load_funding, load_hourly, load_minutes
+from .storage import atomic_write_frame, atomic_write_json, atomic_write_text, empty_funding_frame, load_funding, load_hourly, load_minutes
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,11 @@ class Prepared:
 
 
 _CACHE_SCHEMA_VERSION = 1
+_SIGNAL_CACHE_REQUIRED_COLUMNS = {
+    "trade_id", "strategy", "symbol", "decision_time", "source_bar_time",
+    "entry_time", "planned_exit_time", "requested_units", "priority_score",
+    "priority_order", "signal_scope",
+}
 
 
 def _cache_meta(config: StrategyConfig, window: Window, frame: pl.DataFrame) -> dict[str, Any]:
@@ -67,6 +72,32 @@ def _read_cache_meta(config: StrategyConfig, window: Window, name: str) -> dict[
     return meta
 
 
+def _validate_signal_cache(frame: pl.DataFrame, meta: dict[str, Any]) -> None:
+    missing = _SIGNAL_CACHE_REQUIRED_COLUMNS - set(frame.columns)
+    if missing:
+        raise ValueError(f"signals cache is missing columns: {sorted(missing)}")
+    observed = {
+        "rows": frame.height,
+        "symbols": frame.get_column("symbol").n_unique(),
+        "first_time": frame.get_column("decision_time").min().isoformat() if not frame.is_empty() else None,
+        "last_time": frame.get_column("decision_time").max().isoformat() if not frame.is_empty() else None,
+        "latest_source_time": frame.get_column("source_bar_time").max().isoformat() if not frame.is_empty() else None,
+    }
+    mismatched = [name for name, value in observed.items() if meta.get(name) != value]
+    if mismatched:
+        raise ValueError(f"signals cache content does not match metadata: {', '.join(mismatched)}")
+    if frame.get_column("trade_id").n_unique() != frame.height:
+        raise ValueError("signals cache has duplicate trade_id values")
+    scopes = set(frame.get_column("signal_scope").unique().to_list())
+    if not scopes <= {"window", "protection_history"}:
+        raise ValueError(f"signals cache has invalid signal_scope values: {scopes}")
+    strategies = set(frame.get_column("strategy").unique().to_list())
+    if not strategies <= {"long", "short"}:
+        raise ValueError(f"signals cache has invalid strategy values: {strategies}")
+    if frame.filter((pl.col("signal_scope") == "protection_history") & (pl.col("strategy") != "long")).height:
+        raise ValueError("signals cache protection_history rows must be long")
+
+
 def _write_cache(config: StrategyConfig, window: Window, name: str, frame: pl.DataFrame) -> None:
     directory = config.root / "data" / "cache" / window.id
     directory.mkdir(parents=True, exist_ok=True)
@@ -87,7 +118,10 @@ def _research_shadow_history(config: StrategyConfig, window: Window) -> pl.DataF
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("strategy_version") != config.version or manifest.get("window") != research.id or manifest.get("parameters") != config.values:
         raise ValueError("research shadow history does not match the frozen strategy")
-    return pl.read_parquet(path, columns=SHADOW_HISTORY_COLUMNS)
+    history = pl.read_parquet(path, columns=SHADOW_HISTORY_COLUMNS)
+    if history.height != manifest.get("long_trade_rows"):
+        raise ValueError("research shadow history row count does not match its run manifest")
+    return history
 
 
 def _history_long_signals(features: pl.DataFrame, window: Window, config: StrategyConfig, current: pl.DataFrame) -> pl.DataFrame:
@@ -142,7 +176,7 @@ def _complete_from_signals(
         download_minutes(config, minute_days)
         download_funding(config, funding_months)
     minutes = load_minutes(config.root, minute_days) if minute_days else pl.DataFrame(schema={})
-    funding = load_funding(config.root, funding_months) if funding_months else pl.DataFrame(schema={})
+    funding = load_funding(config.root, funding_months) if funding_months else empty_funding_frame()
     if hourly is None:
         hourly = load_hourly(config.root, window.start, window.end_exclusive, config.values["features"]["hourly_warmup_hours"])
     long_trades, funding_event_detail = execute_long_with_funding_diagnostics(
@@ -197,10 +231,9 @@ def resume(config: StrategyConfig, window: Window, offline: bool) -> dict[str, A
     if not signal_path.exists():
         raise ValueError("resume requires frozen signals cache")
     feature_meta = _read_cache_meta(config, window, "hourly_features")
-    _read_cache_meta(config, window, "signals")
+    signal_meta = _read_cache_meta(config, window, "signals")
     signals = pl.read_parquet(signal_path)
-    if "signal_scope" not in signals.columns:
-        raise ValueError("signals cache is missing signal_scope")
+    _validate_signal_cache(signals, signal_meta)
     current = signals.filter(pl.col("signal_scope") == "window")
     shadow_long = signals.filter(pl.col("signal_scope") == "protection_history")
     return _complete_from_signals(

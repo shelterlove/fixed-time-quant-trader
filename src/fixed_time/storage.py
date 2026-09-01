@@ -17,6 +17,14 @@ KLINE_COLUMNS = ["symbol", "open_time", "open", "high", "low", "close", "quote_v
 FUNDING_COLUMNS = ["symbol", "funding_time", "funding_rate"]
 
 
+def empty_funding_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema={
+        "symbol": pl.String,
+        "funding_time": pl.Datetime("us", "UTC"),
+        "funding_rate": pl.Float64,
+    })
+
+
 def raw_path(root: Path, kind: str) -> Path:
     return root / "data" / "raw" / kind
 
@@ -208,7 +216,7 @@ def load_funding(root: Path, requirements: set[tuple[str, int, int]]) -> pl.Data
     if absent:
         raise DataError("missing funding partitions: " + ", ".join(absent))
     if not paths:
-        return pl.DataFrame(schema={"symbol": pl.String, "funding_time": pl.Datetime("us", "UTC"), "funding_rate": pl.Float64})
+        return empty_funding_frame()
     frame = pl.concat([pl.read_parquet(path, columns=FUNDING_COLUMNS) for path in paths], how="vertical").sort(["symbol", "funding_time"])
     if frame.select(pl.struct(["symbol", "funding_time"]).is_duplicated().any()).item():
         raise DataError("duplicate (symbol, funding_time) across funding partitions")
