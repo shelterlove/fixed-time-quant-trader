@@ -39,7 +39,7 @@ data/raw/ ── storage.py ──► features.py ──► signals.py
 ./deploy.sh
 ```
 
-该命令检查测试网账户、预热 P90 历史并启动 `trader` 和 `dashboard`。监控网页默认在 `http://VPS_IP:8080`，显示运行心跳、账户状态、持仓、最近决策、订单和对账事件。
+该命令检查测试网账户、使用仓库内的紧凑冻结历史预热 P90 状态并启动 `trader` 和 `dashboard`。监控网页默认在 `http://VPS_IP:8080`，显示运行心跳、账户状态、持仓、最近决策、订单和对账事件。
 
 ## 运行
 

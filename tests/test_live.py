@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 import polars as pl
@@ -73,6 +74,16 @@ def test_seeded_shadow_history_is_idempotent(tmp_path: Path) -> None:
     assert store.seed_shadow_history(records) == 1
     assert store.seed_shadow_history(records) == 0
     assert store.shadow_history_stats() == (1, 1)
+
+
+def test_live_seed_uses_packaged_history_when_research_outputs_are_absent(tmp_path: Path) -> None:
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    copyfile(ROOT / "seed" / "initial_shadow_history.csv", seed_dir / "initial_shadow_history.csv")
+    store = StateStore(tmp_path / "state.sqlite3")
+    engine = LiveEngine(replace(_config(tmp_path), root=tmp_path), store=store)
+    assert engine.seed_shadow_history(datetime(2026, 9, 1, tzinfo=UTC)) == 164
+    assert store.shadow_history_stats() == (164, 48)
 
 
 def test_one_long_uses_two_units_and_two_longs_use_one_each(tmp_path: Path) -> None:

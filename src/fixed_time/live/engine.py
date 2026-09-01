@@ -399,10 +399,11 @@ class LiveEngine:
         cutoff = cutoff or datetime.now(UTC)
         earliest = cutoff - timedelta(days=self.config.strategy.values["long"]["protection"]["window_days"])
         records: list[tuple[str, str, bool, float | None]] = []
-        for path in (
+        source_paths = (
             self.config.root / "results" / "local" / "research" / "long_trades.parquet",
             self.config.root / "results" / "local" / "forward_2026_jul_aug" / "long_trades.parquet",
-        ):
+        )
+        for path in source_paths:
             if not path.exists():
                 continue
             frame = pl.read_parquet(path)
@@ -414,6 +415,21 @@ class LiveEngine:
                 if earliest <= exit_time <= cutoff:
                     source_id = f"seed:{path.parent.name}:{index}"
                     records.append((source_id, self._iso(exit_time), bool(row["shadow_activated"]), row["shadow_max_retrace"]))
+        if not records:
+            path = self.config.root / "seed" / "initial_shadow_history.csv"
+            if not path.exists():
+                raise StateError("no local shadow history is available for P90 warm-up")
+            frame = pl.read_csv(path, try_parse_dates=True)
+            required = {"shadow_exit_time", "shadow_activated", "shadow_max_retrace"}
+            if not required.issubset(frame.columns):
+                raise StateError(f"{path} cannot seed P90 history")
+            for index, row in enumerate(frame.select(*required).drop_nulls("shadow_exit_time").to_dicts()):
+                exit_time = row["shadow_exit_time"]
+                if not isinstance(exit_time, datetime):
+                    exit_time = datetime.fromisoformat(str(exit_time))
+                exit_time = exit_time.astimezone(UTC)
+                if earliest <= exit_time <= cutoff:
+                    records.append((f"seed:initial:{index}", self._iso(exit_time), bool(row["shadow_activated"]), row["shadow_max_retrace"]))
         if not records:
             raise StateError("no local shadow history is available for P90 warm-up")
         inserted = self.store.seed_shadow_history(records)
