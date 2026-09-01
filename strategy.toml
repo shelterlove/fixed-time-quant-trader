@@ -1,0 +1,133 @@
+schema_version = 1
+strategy_version = "1.1.0"
+status = "frozen"
+timezone = "UTC"
+
+[execution]
+terminal_data_path_exit = "last_completed_bar_close"
+
+[data]
+archive_base_url = "https://data.binance.vision/data"
+archive_listing_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+futures_api_base_url = "https://fapi.binance.com"
+max_concurrent_requests = 8
+max_attempts_per_object = 3
+keep_downloaded_zip = false
+download_checksum_files = false
+
+[universe]
+venue = "BINANCE_UM"
+quote_asset = "USDT"
+top_n = 100
+liquidity_factor = "v24"
+rank_method = "descending_ordinal"
+rank_tie_break = "symbol_asc"
+
+[features]
+strategy_decision_hours_utc = [6, 8, 14, 15, 17]
+rank_history_hours_utc = [2, 4]
+hourly_warmup_hours = 28
+return_horizons = [1, 4, 24]
+volume_horizons = [1, 4, 24]
+market_quantile_interpolation = "nearest"
+
+[long]
+entry_hours_utc = [14, 15, 17]
+entry_delay_minutes = 1
+rank_max = 10
+rank_factors = ["r1", "r4", "r24", "v1", "v4"]
+market_factor = "market_r24_p10"
+market_lower_exclusive = -0.05
+hard_stop_return = -0.30
+slippage_per_side = 0.001
+taker_fee_per_side = 0.0005
+funding_boundary = "entry_exclusive_exit_inclusive"
+funding_price_proxy = "settlement_minute_open"
+
+[long.legs]
+"14" = { exit_hour_utc = 8, next_day = true }
+"15" = { exit_hour_utc = 8, next_day = true }
+"17" = { exit_hour_utc = 4, next_day = true }
+
+[long.protection]
+method = "ROLLING_P90_BREAKEVEN"
+activation_return = 0.30
+window_days = 365
+retrace_quantile = 0.90
+minimum_history = 100
+minimum_activated_history = 30
+fallback_retrace = 0.30
+break_even_floor = true
+history_source = "all_completed_base_shadow_candidates"
+
+[long.portfolio]
+total_units = 5
+max_positions_per_entry_time = 2
+single_signal_units = 2
+two_signal_units_each = 1
+same_strategy_open_symbol = "skip"
+
+[short]
+entry_hours_utc = [6, 8]
+r24_rank_min = 1
+r24_rank_max = 10
+r4_rank_change_rank_min = 91
+r4_rank_change_rank_max = 100
+volume_diff_rank_min = 1
+volume_diff_rank_max = 5
+volume_diff_logic = "OR"
+market_factor = "market_r1_p10"
+market_lower_inclusive = -0.015
+market_upper_inclusive = 0.0
+hard_stop_return = 0.30
+stop_trigger = "hourly_high"
+gap_fill = "max_hourly_open_or_stop"
+round_trip_stress_cost = 0.003
+funding_model = "none_in_v1_reproduction"
+
+[short.legs]
+"6" = { exit_hour_utc = 20, hold_hours = 14 }
+"8" = { exit_hour_utc = 17, hold_hours = 9 }
+
+[short.portfolio]
+selection = "SEQUENTIAL_06_THEN_08"
+total_daily_units = 3
+max_positions_per_entry_hour = 2
+units_per_signal = 1
+same_symbol_same_day = "allow_in_standalone"
+
+[portfolio]
+mode = "LONG_PRIORITY_SKIP"
+total_units = 5
+long_unit_cap = 5
+short_unit_cap = 3
+unit_value = "free_cash_divided_by_free_units"
+long_priority = true
+short_no_funds = "skip"
+short_eviction_order = "worst_priority_then_signal_time_then_symbol"
+short_eviction_price = "latest_completed_hourly_close"
+same_strategy_open_symbol = "skip"
+cross_strategy_same_symbol = "allow"
+same_timestamp_order = "exits_evictions_long_short"
+
+[windows.research]
+start = "2022-01-01T00:00:00+00:00"
+end_exclusive = "2026-07-01T00:00:00+00:00"
+subwindows = [
+  { start = "2022-01-01T00:00:00+00:00", end_exclusive = "2025-01-01T00:00:00+00:00" },
+  { start = "2025-01-01T00:00:00+00:00", end_exclusive = "2026-01-01T00:00:00+00:00" },
+  { start = "2026-01-01T00:00:00+00:00", end_exclusive = "2026-07-01T00:00:00+00:00" },
+]
+
+[windows.external_2021]
+start = "2021-01-01T00:00:00+00:00"
+end_exclusive = "2022-01-01T00:00:00+00:00"
+protection_history_start = "2020-01-01T00:00:00+00:00"
+
+[windows.forward_2026_jul_aug]
+start = "2026-07-01T00:00:00+00:00"
+end_exclusive = "2026-08-28T15:00:00+00:00"
+
+[windows.reserved_forward]
+start = "2026-09-01T00:00:00+00:00"
+authorized = false
