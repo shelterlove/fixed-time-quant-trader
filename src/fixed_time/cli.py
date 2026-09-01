@@ -32,6 +32,15 @@ def _parser() -> argparse.ArgumentParser:
     forward = commands.add_parser("forward")
     forward.add_argument("--window", required=True)
     forward.add_argument("--confirm", action="store_true", required=True)
+    live_check = commands.add_parser("live-check", help="validate Binance Futures testnet account configuration")
+    live_check.add_argument("--root", default=".")
+    live_seed = commands.add_parser("live-seed", help="seed rolling P90 history from local frozen results")
+    live_seed.add_argument("--root", default=".")
+    live_run = commands.add_parser("live-run", help="run the REST-only automated Futures testnet engine")
+    live_run.add_argument("--root", default=".")
+    live_smoke = commands.add_parser("live-smoke", help="place and close one minimum-size Futures testnet position")
+    live_smoke.add_argument("--root", default=".")
+    live_smoke.add_argument("--symbol", required=True)
     return parser
 
 
@@ -69,6 +78,23 @@ def _authorized_window(config: StrategyConfig, command: str, window_id: str):
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command.startswith("live-"):
+        from .live.config import load_live_config
+        from .live.engine import LiveEngine
+
+        engine = LiveEngine(load_live_config(args.root))
+        try:
+            if args.command == "live-check":
+                print(engine.check())
+            elif args.command == "live-seed":
+                print({"inserted_shadow_records": engine.seed_shadow_history()})
+            elif args.command == "live-smoke":
+                print(engine.smoke_test(args.symbol))
+            else:
+                engine.run_forever()
+        finally:
+            engine.close()
+        return
     config = load_config()
     if args.command == "reconcile":
         _reconcile(config.root, Path(args.legacy_root))

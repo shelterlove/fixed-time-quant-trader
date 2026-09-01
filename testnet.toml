@@ -1,0 +1,19 @@
+# This file is intentionally separate from strategy.toml.  It documents the
+# live/testnet execution profile without mutating the frozen research strategy.
+[environment]
+market_data_base_url = "https://fapi.binance.com"
+trading_base_url = "https://testnet.binancefuture.com"
+trading_environment = "testnet"
+
+[account]
+position_mode = "hedge"
+margin_type = "isolated"
+leverage = 1
+single_asset_mode = true
+
+[runtime]
+account_poll_seconds = 5
+decision_deadline_seconds = 60
+request_timeout_seconds = 10
+max_attempts = 3
+max_concurrent_market_requests = 8

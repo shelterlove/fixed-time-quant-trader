@@ -30,3 +30,10 @@ def test_resume_requires_explicit_offline_mode() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["resume", "--window", "research"])
     assert parser.parse_args(["resume", "--window", "research", "--offline"]).offline is True
+
+
+def test_live_smoke_requires_explicit_symbol() -> None:
+    parser = _parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["live-smoke"])
+    assert parser.parse_args(["live-smoke", "--symbol", "BTCUSDT"]).symbol == "BTCUSDT"

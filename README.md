@@ -77,3 +77,28 @@ pytest -q
 - Python 3.12.10
 - Polars 1.32.0
 - pytest 9.1.1
+
+## Binance 测试网自动执行
+
+研究基线 `research-v1.1.1` 保持冻结。测试网执行层是独立的 REST-only 组件：公开行情仅来自正式网，任何签名交易请求只能发送到 Binance USD-M Futures 测试网。
+
+```powershell
+# 复制 .env.example 为 .env，填入专用测试网 API Key；首次保持 false
+Copy-Item .env.example .env
+
+# 只读检查：Hedge Mode、Single-Asset Mode、逐仓和 1 倍杠杆
+python -m fixed_time.cli live-check
+
+# 在 .env 中临时设置 TRADING_ENABLED=true 后，使用最小名义金额完成一次开仓、硬止损创建、平仓和撤销保护单验证
+python -m fixed_time.cli live-smoke --symbol BTCUSDT
+
+# 从已有冻结研究结果预热滚动 P90 历史；不重跑历史回测
+python -m fixed_time.cli live-seed
+
+# 通过检查后，在 .env 中显式设置 TRADING_ENABLED=true，再启动自动测试网程序
+python -m fixed_time.cli live-run
+```
+
+执行程序只处理 USDT 永续合约；多头信号计算完成后立即以市价入场。时间退出和分钟级多头回撤退出由程序执行，硬止损由 Binance Algo Order 托管。程序采用 SQLite 保存意图、订单、持仓份数和 P90 状态；重启时以交易所持仓为准对账。发现未知仓位、未知订单或缺失硬止损时，程序停止新开仓；已知但无硬止损的仓位会立即平掉。
+
+不要把 `.env`、`runtime/` 或测试网数据库提交到 Git。该版本没有生产网签名交易入口。

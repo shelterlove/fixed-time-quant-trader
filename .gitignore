@@ -8,4 +8,6 @@ legacy_research/
 .venv/
 .env
 .env.*
+!.env.example
 logs/
+runtime/
