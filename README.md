@@ -31,6 +31,16 @@ data/raw/ ── storage.py ──► features.py ──► signals.py
 
 `legacy_research/` 仅供只读对账；`results/reconciliation/` 保存已完成的对账证据。它们不参与回测数据流。
 
+## 测试网 VPS 运行
+
+填写 `.env` 后，在已安装 Docker Compose 的 VPS 上执行：
+
+```bash
+./deploy.sh
+```
+
+该命令检查测试网账户、预热 P90 历史并启动 `trader` 和 `dashboard`。监控网页默认在 `http://VPS_IP:8080`，显示运行心跳、账户状态、持仓、最近决策、订单和对账事件。
+
 ## 运行
 
 ```powershell

@@ -1,0 +1,41 @@
+services:
+  trader:
+    build: .
+    command: ["python", "-m", "fixed_time.cli", "live-run", "--root", "/app"]
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+    healthcheck:
+      test: ["CMD", "python", "-m", "fixed_time.cli", "live-health", "--root", "/app"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: .
+    command: ["python", "-m", "fixed_time.cli", "live-dashboard", "--root", "/app", "--host", "0.0.0.0", "--port", "8080"]
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      trader:
+        condition: service_healthy
+    volumes:
+      - ./runtime:/app/runtime
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
