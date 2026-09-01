@@ -231,6 +231,24 @@ class _SmokeFailureClient(_Client):
         self.cancelled.append(algo_id)
 
 
+class _MissingAverageSmokeClient(_Client):
+    def __init__(self):
+        super().__init__()
+        self.queries: list[str] = []
+        self.cancelled: list[str] = []
+
+    def market_order(self, symbol: str, side: str, position_side: str, quantity: Decimal, client_order_id: str) -> dict:
+        self.orders.append((symbol, side, position_side, quantity))
+        return {"status": "FILLED", "executedQty": format(quantity, "f")}
+
+    def query_order(self, _symbol: str, client_order_id: str) -> dict:
+        self.queries.append(client_order_id)
+        return {"status": "FILLED", "executedQty": ".05", "avgPrice": "100"}
+
+    def cancel_algo(self, _symbol: str, algo_id: str) -> None:
+        self.cancelled.append(algo_id)
+
+
 def test_entry_creates_exchange_stop_and_persistent_position(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = StateStore(tmp_path / "state.sqlite3")
@@ -311,4 +329,15 @@ def test_smoke_failure_retries_same_exit_and_cancels_stop_after_cleanup(tmp_path
     with pytest.raises(BinanceError, match="smoke exit did not fill"):
         engine.smoke_test("AAAUSDT")
     assert client.sell_attempts == 2
+    assert client.cancelled == ["99"]
+
+
+def test_smoke_fetches_average_price_before_creating_stop(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    client = _MissingAverageSmokeClient()
+    engine = LiveEngine(config, client=client, store=StateStore(tmp_path / "state.sqlite3"))
+    engine.check = lambda: {"positions": [], "open_orders": [], "open_algo_orders": []}  # type: ignore[method-assign]
+    result = engine.smoke_test("AAAUSDT")
+    assert result["entry_price"] == "100"
+    assert len(client.queries) == 1
     assert client.cancelled == ["99"]

@@ -159,6 +159,8 @@ class LiveEngine:
                 raise exc
         executed = Decimal(str(response.get("executedQty", "0")))
         requested = Decimal(str(position["quantity"]))
+        if executed > 0:
+            response = self._with_average_price(str(position["symbol"]), order_id, response)
         self.store.record_execution(str(position["intent_id"]), order_id, "EXIT", response, reason)
         if executed != requested:
             if executed > 0:
@@ -205,10 +207,9 @@ class LiveEngine:
         if filled <= 0:
             self.store.set_intent_status(intent_id, "ENTRY_UNFILLED")
             raise BinanceError(f"entry did not fill: {intent_id}")
+        response = self._with_average_price(symbol, client_order_id, response)
         self.store.record_execution(intent_id, client_order_id, "ENTRY", response)
         entry_price = Decimal(str(response.get("avgPrice", "0")))
-        if entry_price <= 0:
-            raise BinanceError(f"entry has no average price: {intent_id}")
         retrace = allowed_retrace(self.store.shadow_history(), decision, self.config.strategy) if strategy == "long" else None
         self.store.open_position(intent_id, format(filled, "f"), format(entry_price, "f"), retrace)
         protected = next(item for item in self.store.open_positions() if item["intent_id"] == intent_id)
@@ -315,13 +316,15 @@ class LiveEngine:
         entry = self._market_or_query(symbol, "BUY", "LONG", quantity, entry_id)
         if str(entry.get("status")) != "FILLED" or Decimal(str(entry.get("executedQty", "0"))) <= 0:
             raise BinanceError("smoke entry did not fill")
-        filled, average = Decimal(str(entry["executedQty"])), Decimal(str(entry["avgPrice"]))
+        filled = Decimal(str(entry["executedQty"]))
         stop_id = self._client_id("q", "long", symbol, now)
-        trigger = stop_trigger_price(average * (Decimal("1") + Decimal(str(self.config.strategy.values["long"]["hard_stop_return"]))), filters["tick_size"], "SELL")
         stop: dict[str, Any] | None = None
         exit_id = entry_id.replace("ft-m-", "ft-z-", 1)
         exited = False
         try:
+            entry = self._with_average_price(symbol, entry_id, entry)
+            average = Decimal(str(entry["avgPrice"]))
+            trigger = stop_trigger_price(average * (Decimal("1") + Decimal(str(self.config.strategy.values["long"]["hard_stop_return"]))), filters["tick_size"], "SELL")
             try:
                 stop = self.client.stop_market(symbol, "SELL", "LONG", trigger, stop_id)
             except BinanceError as exc:
@@ -360,6 +363,14 @@ class LiveEngine:
                 return self.client.query_order(symbol, client_order_id)
             except BinanceError:
                 raise exc
+
+    def _with_average_price(self, symbol: str, client_order_id: str, response: dict[str, Any]) -> dict[str, Any]:
+        if Decimal(str(response.get("avgPrice", "0"))) > 0:
+            return response
+        authoritative = self.client.query_order(symbol, client_order_id)
+        if Decimal(str(authoritative.get("avgPrice", "0"))) <= 0:
+            raise BinanceError(f"filled order has no average price: {client_order_id}")
+        return authoritative
 
     def seed_shadow_history(self, cutoff: datetime | None = None) -> int:
         cutoff = cutoff or datetime.now(UTC)
