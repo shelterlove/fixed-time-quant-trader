@@ -322,7 +322,12 @@ class LiveEngine:
         admissions: list[Admission] = []
         try:
             self.reconcile()
-            symbols = self.client.tradable_symbols()
+            # Preserve frozen cross-sectional ranks by computing features from
+            # the entire public market-data universe.  Testnet availability is
+            # an execution constraint, so it filters candidates only after
+            # their ranks and signal conditions have been calculated.
+            symbols = self.client.market_data_symbols()
+            testnet_symbols = set(self.client.trading_symbols())
             snapshot = hourly if hourly is not None else self.client.hourly_snapshot(symbols, 30)
             snapshot = snapshot.filter(pl.col("open_time") < pl.lit(decision_time))
             if self._now() > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
@@ -331,9 +336,15 @@ class LiveEngine:
                 return []
             candidates = decision_candidates(snapshot, decision_time, self.config.strategy)
             for candidate in candidates:
+                candidate["testnet_eligible"] = str(candidate["symbol"]) in testnet_symbols
                 if candidate["strategy"] == "long":
+                    # P90 history is defined from every completed base-shadow
+                    # candidate, not only account admissions.  A contract that
+                    # testnet cannot order still has a valid public market path
+                    # and must not change that frozen protection population.
                     self.store.add_shadow_task(str(candidate["trade_id"]), str(candidate["symbol"]), self._iso(candidate["entry_time"]), self._iso(candidate["planned_exit_time"]))
-            admissions = plan_admissions(candidates, self.store.open_positions(), self.config.strategy)
+            executable_candidates = [candidate for candidate in candidates if candidate["testnet_eligible"]]
+            admissions = plan_admissions(executable_candidates, self.store.open_positions(), self.config.strategy)
             for admission in admissions:
                 for victim_id in admission.evict_intent_ids:
                     victim = next(row for row in self.store.open_positions() if row["intent_id"] == victim_id)

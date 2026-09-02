@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import json
 from pathlib import Path
 from shutil import copyfile
 import sqlite3
@@ -401,6 +402,24 @@ class _ExchangeClockClient:
         return self._now
 
 
+class _DecisionClient(_RecoveryClient):
+    def __init__(self, now: datetime):
+        super().__init__()
+        self._now = now
+
+    def now(self) -> datetime:
+        return self._now
+
+    def market_data_symbols(self) -> list[str]:
+        return ["BTCUSDT", "UAIUSDT"]
+
+    def trading_symbols(self) -> list[str]:
+        return ["BTCUSDT"]
+
+    def ensure_symbol_config(self, _symbol: str) -> None:
+        return None
+
+
 class _PartialCloseClient(_Client):
     def __init__(self):
         super().__init__()
@@ -664,6 +683,79 @@ def test_decision_deadline_uses_the_exchange_aligned_clock(tmp_path: Path) -> No
     engine = LiveEngine(_config(tmp_path), client=_ExchangeClockClient(decision + timedelta(seconds=121)), store=store)
     assert engine.process_decision(decision) == []
     assert store.decision_done(decision.isoformat())
+
+
+def test_decision_preserves_public_ranks_then_filters_unorderable_testnet_candidate(monkeypatch, tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 2, 8, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    client = _DecisionClient(decision)
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    hourly = pl.DataFrame([{
+        "symbol": "BTCUSDT", "open_time": decision - timedelta(hours=1), "open": 100., "high": 101., "low": 99., "close": 100.,
+        "quote_volume": 1., "trade_count": 1,
+    }, {
+        "symbol": "UAIUSDT", "open_time": decision - timedelta(hours=1), "open": 100., "high": 101., "low": 99., "close": 100.,
+        "quote_volume": 1., "trade_count": 1,
+    }])
+    seen: list[str] = []
+
+    def candidates(snapshot, _decision_time, _config):
+        seen.extend(snapshot.get_column("symbol").unique().sort().to_list())
+        return [_candidate("long", "UAIUSDT", decision)]
+
+    monkeypatch.setattr("fixed_time.live.engine.decision_candidates", candidates)
+    assert engine.process_decision(decision, hourly=hourly) == []
+    assert seen == ["BTCUSDT", "UAIUSDT"]
+    row = store.connection.execute("SELECT universe_size, candidate_count, admission_count, status, detail_json FROM decision_runs").fetchone()
+    assert tuple(row)[:4] == (2, 1, 0, "COMPLETE")
+    assert json.loads(row[4])["candidates"][0]["testnet_eligible"] is False
+    assert store.connection.execute("SELECT COUNT(*) FROM shadow_tasks").fetchone()[0] == 1
+
+
+def test_full_short_decision_path_filters_testnet_only_after_public_signal_ranking(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 2, 8, tzinfo=UTC)
+    symbols = [f"S{index:03d}USDT" for index in range(99)] + ["UAIUSDT"]
+    rows: list[dict] = []
+    first = decision - timedelta(hours=30)
+    for symbol in symbols:
+        for index in range(30):
+            close, volume = 100., 10.
+            if symbol == "UAIUSDT":
+                close, volume = 100., 1.
+                if index == 20:
+                    close = 100.
+                elif index in {24, 25, 26, 27, 28}:
+                    close = 200.
+                elif index == 29:
+                    close, volume = 150., 1000.
+            elif symbol in symbols[:10] and index == 29:
+                close = 99.
+            rows.append({
+                "symbol": symbol, "open_time": first + timedelta(hours=index), "open": close, "high": close,
+                "low": close, "close": close, "quote_volume": volume, "trade_count": 1,
+            })
+    snapshot = pl.DataFrame(rows)
+
+    blocked_client = _DecisionClient(decision)
+    blocked_client.market_data_symbols = lambda: symbols  # type: ignore[method-assign]
+    blocked_client.trading_symbols = lambda: [symbol for symbol in symbols if symbol != "UAIUSDT"]  # type: ignore[method-assign]
+    blocked_store = StateStore(tmp_path / "blocked.sqlite3")
+    blocked = LiveEngine(_config(tmp_path), client=blocked_client, store=blocked_store)
+    assert blocked.process_decision(decision, hourly=snapshot) == []
+    blocked_run = blocked_store.connection.execute("SELECT candidate_count, admission_count, status FROM decision_runs").fetchone()
+    assert tuple(blocked_run) == (1, 0, "COMPLETE")
+    assert blocked_client.orders == []
+
+    supported_client = _DecisionClient(decision)
+    supported_client.market_data_symbols = lambda: symbols  # type: ignore[method-assign]
+    supported_client.trading_symbols = lambda: symbols  # type: ignore[method-assign]
+    supported_store = StateStore(tmp_path / "supported.sqlite3")
+    supported = LiveEngine(_config(tmp_path), client=supported_client, store=supported_store)
+    admissions = supported.process_decision(decision, hourly=snapshot)
+    assert [(item.candidate["strategy"], item.candidate["symbol"], item.units) for item in admissions] == [("short", "UAIUSDT", 1)]
+    position = supported_store.open_positions()[0]
+    assert (position["symbol"], position["position_side"], position["stop_algo_id"]) == ("UAIUSDT", "SHORT", "recovered-stop")
+    assert [(symbol, side, position_side) for symbol, side, position_side, _ in supported_client.orders] == [("UAIUSDT", "SELL", "SHORT")]
 
 
 def test_decision_collection_window_includes_the_second_minute(tmp_path: Path) -> None:

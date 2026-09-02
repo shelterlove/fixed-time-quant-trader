@@ -116,11 +116,17 @@ class BinanceRest:
             if item.get("quoteAsset") == "USDT" and item.get("contractType") == "PERPETUAL" and item.get("status") == "TRADING"
         }
 
+    def market_data_symbols(self) -> list[str]:
+        """The full public USDⓈ-M universe used for frozen signal rankings."""
+        return sorted(self._perpetual_usdt_symbols(self.exchange_info()))
+
+    def trading_symbols(self) -> list[str]:
+        """USDⓈ-M contracts that Binance currently accepts on testnet."""
+        return sorted(self._perpetual_usdt_symbols(self.trading_exchange_info()))
+
     def tradable_symbols(self) -> list[str]:
-        """Symbols with public price history that can also be ordered on testnet."""
-        public = self._perpetual_usdt_symbols(self.exchange_info())
-        testnet = self._perpetual_usdt_symbols(self.trading_exchange_info())
-        return sorted(public & testnet)
+        """Symbols with both public price history and testnet order support."""
+        return sorted(set(self.market_data_symbols()) & set(self.trading_symbols()))
 
     def symbol_filters(self, symbol: str) -> dict[str, Decimal]:
         # Quantity and stop-price filters must be those accepted by the venue
