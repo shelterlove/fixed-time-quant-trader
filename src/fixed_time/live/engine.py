@@ -22,7 +22,7 @@ class LiveEngine:
         self.client = client or BinanceRest(config)
         self.store = store or StateStore(config.database_path)
         self._stop_requested = Event()
-        self._started_at = self._iso(datetime.now(UTC))
+        self._started_at = self._iso(self._now())
 
     def close(self) -> None:
         self.store.close()
@@ -33,6 +33,18 @@ class LiveEngine:
     @staticmethod
     def _iso(value: datetime) -> str:
         return value.astimezone(UTC).isoformat()
+
+    def _now(self) -> datetime:
+        clock = getattr(self.client, "now", None)
+        value = clock() if callable(clock) else datetime.now(UTC)
+        if value.tzinfo is None:
+            raise StateError("exchange clock must be timezone-aware")
+        return value.astimezone(UTC)
+
+    def _sync_clock(self) -> None:
+        sync = getattr(self.client, "sync_time", None)
+        if callable(sync):
+            sync()
 
     @staticmethod
     def _client_id(prefix: str, strategy: str, symbol: str, when: datetime) -> str:
@@ -300,7 +312,7 @@ class LiveEngine:
             return []
         if self.store.decision_done(self._iso(decision_time)):
             return []
-        if datetime.now(UTC) > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
+        if self._now() > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
             self.store.mark_decision_done(self._iso(decision_time))
             return []
         decision_key = self._iso(decision_time)
@@ -313,7 +325,7 @@ class LiveEngine:
             symbols = self.client.tradable_symbols()
             snapshot = hourly if hourly is not None else self.client.hourly_snapshot(symbols, 30)
             snapshot = snapshot.filter(pl.col("open_time") < pl.lit(decision_time))
-            if datetime.now(UTC) > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
+            if self._now() > decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
                 self.store.mark_decision_done(decision_key)
                 self.store.finish_decision(decision_key, len(symbols), candidates, [], error="decision deadline exceeded")
                 return []
@@ -339,30 +351,52 @@ class LiveEngine:
             raise
 
     def process_due_exits(self, now: datetime | None = None) -> None:
-        now = now or datetime.now(UTC)
+        now = now or self._now()
         for position in self.store.open_positions():
             if datetime.fromisoformat(str(position["planned_exit_time"])) <= now:
                 self._close(position, "PLANNED_EXIT")
 
     def process_long_protection(self, now: datetime | None = None) -> None:
-        now = now or datetime.now(UTC)
+        now = now or self._now()
         for position in self.store.open_positions():
             if position["strategy"] != "long":
                 continue
-            bars = self.client.klines(str(position["symbol"]), "1m", 2)
-            closed = bars.filter(pl.col("open_time") + pl.duration(minutes=1) <= pl.lit(now)).sort("open_time")
-            if closed.is_empty():
-                continue
-            bar = closed.tail(1).to_dicts()[0]
-            if position.get("protection_last_bar_time") == self._iso(bar["open_time"]):
-                continue
-            should_exit, active, peak = long_protection_update(position, bar, self.config.strategy)
-            self.store.update_protection(str(position["intent_id"]), active, format(peak, "f"), self._iso(bar["open_time"]))
-            if should_exit:
-                self._close(position, "PROTECTION")
+            for bar in self._unprocessed_protection_bars(position, now):
+                should_exit, active, peak = long_protection_update(position, bar, self.config.strategy)
+                self.store.update_protection(str(position["intent_id"]), active, format(peak, "f"), self._iso(bar["open_time"]))
+                if should_exit:
+                    self._close(position, "PROTECTION")
+                    break
+
+    def _unprocessed_protection_bars(self, position: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+        last = position.get("protection_last_bar_time")
+        start = (
+            datetime.fromisoformat(str(last)) + timedelta(minutes=1)
+            if last else datetime.fromisoformat(str(position["decision_time"]))
+        )
+        end_exclusive = now.replace(second=0, microsecond=0)
+        if start >= end_exclusive:
+            return []
+        expected = int((end_exclusive - start).total_seconds() // 60)
+        if expected > 1_500:
+            raise StateError(f"protection catch-up exceeds Binance limit for {position['intent_id']}")
+        frame = self.client.klines(
+            str(position["symbol"]), "1m", expected, start_time=start,
+            end_time=end_exclusive - timedelta(milliseconds=1),
+        )
+        closed = frame.filter(
+            (pl.col("open_time") >= pl.lit(start)) & (pl.col("open_time") < pl.lit(end_exclusive))
+        ).sort("open_time")
+        bars = closed.to_dicts()
+        if (
+            len(bars) != expected or not bars or bars[0]["open_time"] != start
+            or any(right["open_time"] - left["open_time"] != timedelta(minutes=1) for left, right in zip(bars, bars[1:]))
+        ):
+            raise StateError(f"incomplete protection minute path for {position['intent_id']}")
+        return bars
 
     def process_due_shadows(self, now: datetime | None = None) -> None:
-        now = now or datetime.now(UTC)
+        now = now or self._now()
         for task in self.store.due_shadow_tasks(self._iso(now)):
             entry = datetime.fromisoformat(str(task["entry_time"]))
             planned = datetime.fromisoformat(str(task["planned_exit_time"]))
@@ -405,7 +439,7 @@ class LiveEngine:
         price = self.client.latest_price(symbol)
         minimum = max(filters["min_qty"], filters["min_notional"] / price)
         quantity = (minimum / filters["step_size"]).to_integral_value(rounding=ROUND_CEILING) * filters["step_size"]
-        now = datetime.now(UTC)
+        now = self._now()
         entry_id = self._client_id("m", "long", symbol, now)
         entry = self._market_or_query(symbol, "BUY", "LONG", quantity, entry_id)
         if str(entry.get("status")) != "FILLED" or Decimal(str(entry.get("executedQty", "0"))) <= 0:
@@ -475,7 +509,7 @@ class LiveEngine:
         return authoritative
 
     def seed_shadow_history(self, cutoff: datetime | None = None) -> int:
-        cutoff = cutoff or datetime.now(UTC)
+        cutoff = cutoff or self._now()
         earliest = cutoff - timedelta(days=self.config.strategy.values["long"]["protection"]["window_days"])
         records: list[tuple[str, str, bool, float | None]] = []
         source_paths = (
@@ -531,7 +565,7 @@ class LiveEngine:
 
     def run_forever(self) -> None:
         self.check()
-        next_poll = datetime.now(UTC)
+        next_poll = self._now()
         next_full_reconcile = next_poll
         failures = 0
         previous_handlers: dict[int, Any] = {}
@@ -542,7 +576,7 @@ class LiveEngine:
         try:
             while not self._stop_requested.is_set():
                 try:
-                    now = datetime.now(UTC)
+                    now = self._now()
                     if now >= next_poll:
                         full_reconcile = now >= next_full_reconcile
                         self.reconcile(full=full_reconcile)
@@ -554,8 +588,11 @@ class LiveEngine:
                         if full_reconcile:
                             next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
                     if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
-                        self.process_decision(now.replace(second=0, microsecond=0))
-                        next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
+                        self._sync_clock()
+                        now = self._now()
+                        if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
+                            self.process_decision(now.replace(second=0, microsecond=0))
+                            next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
                     failures = 0
                     self._stop_requested.wait(1)
                 except StateError as exc:

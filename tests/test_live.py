@@ -183,6 +183,23 @@ def test_market_post_is_not_retried_after_transport_error(tmp_path: Path) -> Non
     assert len(calls) == 1
 
 
+def test_minute_kline_query_can_request_an_exact_closed_interval(tmp_path: Path) -> None:
+    captured: dict[str, str] = {}
+    start = datetime(2026, 9, 1, 14, tzinfo=UTC)
+
+    def transport(_method, _url, params, _headers, _timeout):
+        captured.update(params)
+        return [[int(start.timestamp() * 1000), "100", "101", "99", "100", "0", 0, "1", 1]]
+
+    client = BinanceRest(_config(tmp_path), transport=transport)
+    client.klines("AAAUSDT", "1m", 1, start_time=start, end_time=start + timedelta(minutes=1, milliseconds=-1))
+    assert captured == {
+        "symbol": "AAAUSDT", "interval": "1m", "limit": "1",
+        "startTime": str(int(start.timestamp() * 1000)),
+        "endTime": str(int((start + timedelta(minutes=1, milliseconds=-1)).timestamp() * 1000)),
+    }
+
+
 def test_configure_symbol_sets_isolated_one_x_only_when_needed(tmp_path: Path) -> None:
     symbol_config_calls = 0
     paths: list[str] = []
@@ -273,11 +290,30 @@ class _ProtectionClient(_Client):
         super().__init__()
         self.bar_time = bar_time
 
-    def klines(self, _symbol: str, _interval: str, _limit: int) -> pl.DataFrame:
+    def klines(self, _symbol: str, _interval: str, _limit: int, **_kwargs) -> pl.DataFrame:
         return pl.DataFrame([{
             "symbol": "AAAUSDT", "open_time": self.bar_time, "open": 100., "high": 130., "low": 100., "close": 120.,
             "quote_volume": 1., "trade_count": 1,
         }])
+
+
+class _CatchupProtectionClient(_Client):
+    def __init__(self, frame: pl.DataFrame):
+        super().__init__()
+        self.frame = frame
+        self.requests: list[dict] = []
+
+    def klines(self, _symbol: str, _interval: str, _limit: int, **kwargs) -> pl.DataFrame:
+        self.requests.append(kwargs)
+        return self.frame
+
+
+class _ExchangeClockClient:
+    def __init__(self, now: datetime):
+        self._now = now
+
+    def now(self) -> datetime:
+        return self._now
 
 
 class _PartialCloseClient(_Client):
@@ -461,12 +497,42 @@ def test_long_protection_does_not_reprocess_activation_bar_after_restart(tmp_pat
     store.create_intent({"intent_id": "open", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time.isoformat(),
                          "planned_exit_time": (time + timedelta(hours=1)).isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "ft-e-l-AAAUSDT-2609011400"})
     store.open_position("open", ".1", "100", .1, "stop")
+    store.update_protection("open", False, "100", time.isoformat())
     bar_time = time + timedelta(minutes=1)
     client = _ProtectionClient(bar_time)
     LiveEngine(config, client=client, store=store).process_long_protection(bar_time + timedelta(minutes=1))
     assert store.open_positions()[0]["protection_last_bar_time"] == bar_time.isoformat()
     LiveEngine(config, client=client, store=store).process_long_protection(bar_time + timedelta(minutes=1))
     assert client.orders == []
+
+
+def test_long_protection_replays_every_unprocessed_completed_minute_after_a_gap(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "catchup", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time.isoformat(),
+                         "planned_exit_time": (time + timedelta(hours=1)).isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "ft-e-l-AAAUSDT-2609011400"})
+    store.open_position("catchup", ".1", "100", .1, "stop")
+    store.update_protection("catchup", True, "130", time.isoformat())
+    frame = pl.DataFrame([
+        {"symbol": "AAAUSDT", "open_time": time + timedelta(minutes=1), "open": 125., "high": 129., "low": 120., "close": 125., "quote_volume": 1., "trade_count": 1},
+        {"symbol": "AAAUSDT", "open_time": time + timedelta(minutes=2), "open": 120., "high": 129., "low": 115., "close": 120., "quote_volume": 1., "trade_count": 1},
+        {"symbol": "AAAUSDT", "open_time": time + timedelta(minutes=3), "open": 120., "high": 129., "low": 119., "close": 120., "quote_volume": 1., "trade_count": 1},
+    ])
+    client = _CatchupProtectionClient(frame)
+    engine = LiveEngine(config, client=client, store=store)
+    engine.process_long_protection(time + timedelta(minutes=4))
+    assert store.open_positions() == []
+    assert [(side, position_side) for _, side, position_side, _ in client.orders] == [("SELL", "LONG")]
+    assert client.requests == [{"start_time": time + timedelta(minutes=1), "end_time": time + timedelta(minutes=4, milliseconds=-1)}]
+
+
+def test_decision_deadline_uses_the_exchange_aligned_clock(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    engine = LiveEngine(_config(tmp_path), client=_ExchangeClockClient(decision + timedelta(seconds=61)), store=store)
+    assert engine.process_decision(decision) == []
+    assert store.decision_done(decision.isoformat())
 
 
 def test_partial_exit_uses_a_new_persistent_client_order_id_for_the_remaining_position(tmp_path: Path) -> None:

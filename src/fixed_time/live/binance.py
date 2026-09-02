@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 import hashlib
 import hmac
@@ -91,6 +91,10 @@ class BinanceRest:
         self.server_offset_ms = int(result["serverTime"]) - (before + after) // 2
         return self.server_offset_ms
 
+    def now(self) -> datetime:
+        """Current Binance-aligned UTC time for scheduling and bar completion."""
+        return datetime.now(UTC) + timedelta(milliseconds=self.server_offset_ms)
+
     def exchange_info(self) -> dict[str, Any]:
         result = self._request("GET", self.config.market_data_base_url, "/fapi/v1/exchangeInfo")
         if not isinstance(result, dict) or not isinstance(result.get("symbols"), list):
@@ -116,8 +120,15 @@ class BinanceRest:
         except KeyError as exc:
             raise BinanceError(f"{symbol} has incomplete order filters") from exc
 
-    def klines(self, symbol: str, interval: str, limit: int) -> pl.DataFrame:
-        raw = self._request("GET", self.config.market_data_base_url, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": str(limit)})
+    def klines(
+        self, symbol: str, interval: str, limit: int, *, start_time: datetime | None = None, end_time: datetime | None = None,
+    ) -> pl.DataFrame:
+        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
+        if start_time is not None:
+            params["startTime"] = str(int(start_time.timestamp() * 1000))
+        if end_time is not None:
+            params["endTime"] = str(int(end_time.timestamp() * 1000))
+        raw = self._request("GET", self.config.market_data_base_url, "/fapi/v1/klines", params)
         if not isinstance(raw, list):
             raise BinanceError(f"invalid kline response for {symbol}")
         rows = []
