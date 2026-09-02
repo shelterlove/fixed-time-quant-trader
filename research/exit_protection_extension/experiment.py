@@ -191,6 +191,25 @@ def extend_recently_activated_trade(
     return ExtensionOutcome(deadline, float(final["close"]), "EXTENSION_CAP", activated_at, maximum_retrace, lowest / reference - 1, highest / reference - 1)
 
 
+def recently_activated_at_planned_exit(
+    row: dict[str, Any], bars: list[dict[str, Any]], long_rules: dict[str, Any], lookback: timedelta,
+) -> bool:
+    """Cheap first pass using only the already-required base path.
+
+    Rows supplied here are frozen `PLANNED_EXIT` outcomes, so neither hard stop
+    nor P90 protection fired before the planned exit. We only need the first
+    activation timestamp to determine whether extra 24-hour data is needed.
+    """
+    if row["exit_reason"] != "PLANNED_EXIT" or not bool(row["shadow_activated"]):
+        return False
+    activation_price = float(row["entry_reference"]) * (1 + long_rules["protection"]["activation_return"])
+    activated_at = next(
+        (bar["open_time"] + timedelta(minutes=1) for bar in bars if float(bar["high"]) >= activation_price),
+        None,
+    )
+    return activated_at is not None and row["planned_exit_time"] - lookback < activated_at <= row["planned_exit_time"]
+
+
 def _funding_return(
     row: dict[str, Any], exit_time: datetime, funding_by_symbol: dict[str, list[dict[str, Any]]], minute_open_by_symbol: dict[str, dict[datetime, float]], long_rules: dict[str, Any],
 ) -> float:
@@ -211,8 +230,24 @@ def build_variant_long_trades(config: StrategyConfig, baseline: pl.DataFrame, se
     candidates = baseline.filter((pl.col("exit_reason") == "PLANNED_EXIT") & pl.col("shadow_activated")).to_dicts()
     if not candidates:
         return baseline, ExtensionMarketData({}, {}, {})
-    minutes = load_minutes(config.root, _date_requirements(candidates, settings.maximum_extension))
-    funding = load_funding(config.root, _funding_requirements(candidates, settings.maximum_extension))
+    base_minutes = load_minutes(config.root, _date_requirements(candidates, timedelta(0)))
+    base_by_symbol = {
+        key[0] if isinstance(key, tuple) else key: group.sort("open_time")
+        for key, group in base_minutes.group_by("symbol", maintain_order=True)
+    }
+    eligible = [
+        row for row in candidates
+        if recently_activated_at_planned_exit(
+            row, _continuous_bars(base_by_symbol, row, row["planned_exit_time"]), config.values["long"], settings.activation_lookback,
+        )
+    ]
+    if not eligible:
+        return baseline, ExtensionMarketData({}, {}, {})
+    # Keep the large minute read bounded to actual extensions, not every base
+    # shadow that happened to activate at some earlier point in its lifetime.
+    del base_minutes, base_by_symbol
+    minutes = load_minutes(config.root, _date_requirements(eligible, settings.maximum_extension))
+    funding = load_funding(config.root, _funding_requirements(eligible, settings.maximum_extension))
     minute_by_symbol = {
         key[0] if isinstance(key, tuple) else key: group.sort("open_time")
         for key, group in minutes.group_by("symbol", maintain_order=True)
@@ -225,7 +260,7 @@ def build_variant_long_trades(config: StrategyConfig, baseline: pl.DataFrame, se
         key[0] if isinstance(key, tuple) else key: group.to_dicts()
         for key, group in funding.group_by("symbol", maintain_order=True)
     }
-    candidate_ids = {row["trade_id"] for row in candidates}
+    candidate_ids = {row["trade_id"] for row in eligible}
     market = ExtensionMarketData(minute_by_symbol, minute_open_by_symbol, funding_by_symbol)
     rows: list[dict[str, Any]] = []
     for original in baseline.sort("entry_time").to_dicts():

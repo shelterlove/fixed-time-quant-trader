@@ -1,7 +1,7 @@
 [experiment]
-id = "recent_protection_extension_12h"
+id = "recent_protection_extension_24h"
 source_window = "research"
 activation_lookback_hours = 4
-maximum_extension_hours = 12
+maximum_extension_hours = 24
 long_eviction_after_extension_hours = 4
 out_of_sample_fraction = 0.20
