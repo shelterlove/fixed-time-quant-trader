@@ -14,7 +14,7 @@ from fixed_time.config import load_config
 from fixed_time.live.binance import BinanceError, BinanceRest, quantize_down, stop_trigger_price
 from fixed_time.live.config import LiveConfig, LongExtensionConfig, load_live_config
 from fixed_time.live.engine import LiveEngine
-from fixed_time.live.state import StateStore
+from fixed_time.live.state import RuntimeLock, StateError, StateStore
 from fixed_time.live.strategy import Admission, allowed_retrace, long_protection_update, plan_admissions, unit_notional
 
 
@@ -57,6 +57,19 @@ def test_live_config_defaults_to_disabled(monkeypatch, tmp_path: Path) -> None:
     assert config.trading_enabled is False
     assert config.trading_base_url == "https://demo-fapi.binance.com"
     assert config.long_extension == LongExtensionConfig(True, 4, 24, 4)
+
+
+def test_runtime_lock_blocks_a_second_state_writer(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first, second = RuntimeLock(path), RuntimeLock(path)
+    first.acquire()
+    try:
+        with pytest.raises(StateError, match="already locked"):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
 
 
 def test_state_preserves_logical_units(tmp_path: Path) -> None:

@@ -1,39 +1,41 @@
-# Recent-protection exit extension study
+# 近期保护激活后的退出延长研究
 
-This directory is intentionally isolated from the production strategy. It does not read `.env`, contact Binance, alter `src/`, or change the running testnet trader.
+本目录是独立研究区：它不读取 `.env`、不连接 Binance、不会修改 `src/`，也不会改变正在运行的测试网交易程序。
 
-## Hypothesis
+研究结论已由测试网执行层采用，但冻结研究基线保持不变。实时规则见 [`../../LIVE_EXTENSION.md`](../../LIVE_EXTENSION.md)；本目录仍只用于复现和审查研究，不参与日常交易运行。
 
-For a long that reaches its original planned exit `E`, extend the position only when its first completed-minute activation of the existing drawdown protection falls in `(E - 4h, E]`.
+## 假设与固定口径
 
-The extended position keeps the frozen hard-stop, P90 protection threshold, peak-update order, fees, slippage, funding treatment, and five-unit portfolio rules. It exits at the first of:
+对到达原计划退出 `E` 的多头，仅在其首次进入既有回撤保护状态的已完成一分钟K线落在 `(E - 4h, E]` 时延长持仓。
 
-1. hard stop;
-2. P90 protection exit;
-3. `E + 24h` (`EXTENSION_CAP`).
+延长持仓保留冻结的硬止损、P90 保护阈值、峰值更新顺序、手续费、滑点、资金费处理与五份资金组合规则，并以下列最先发生者退出：
 
-When a later long needs capacity, the frozen long-priority sequence first evicts open shorts from worse to better priority. If capacity remains insufficient, it then closes an extended long only after that long has exceeded `E + 4h`, selecting the oldest eligible extension first. If no later long needs capacity, the extended long remains open until its normal protection exit or `E + 24h`.
+1. 硬止损；
+2. P90 保护退出；
+3. `E + 24h`（`EXTENSION_CAP`）。
 
-Extended exits are not used as P90 training observations.
+当后续多头需要容量时，固定的多头优先顺序先从差到好关闭空头。容量仍不足时，只有已超过 `E + 4h` 的延长多头可被关闭，最早释放者优先。若无后续多头需要容量，延长持仓一直保留至正常保护退出或 `E + 24h`。
 
-## Run
+延长持仓退出不作为 P90 训练样本。
 
-From the repository root, after the frozen research result and raw historical data are present:
+## 运行
+
+仓库根目录已具备冻结研究结果和原始历史数据后，运行：
 
 ```powershell
 python research/exit_protection_extension/run_experiment.py
 ```
 
-The default configuration is reset to the selected 24-hour candidate after the 48-hour comparison. The run reads `results/local/research/` and writes only ignored files under `research/exit_protection_extension/results/recent_protection_extension_24h/`:
+默认配置为选定的 24h 候选。运行读取 `results/local/research/`，仅向被 Git 忽略的 `research/exit_protection_extension/results/recent_protection_extension_24h/` 写入：
 
-- `summary.json`: frozen inputs, rule, full-sample and final-20%-period metrics;
-- `comparison.csv`: baseline versus variant portfolio metrics;
-- `yearly_comparison.csv`: baseline versus variant returns and realized drawdown for each calendar year;
-- `extended_trades.csv`: each actually extended trade and its final reason;
-- variant trade, allocation-audit, and account-ledger files for inspection.
+- `summary.json`：冻结输入、规则、全样本和最终 20% 时段指标；
+- `comparison.csv`：基线与变体组合指标；
+- `yearly_comparison.csv`：每个自然年的收益和已实现回撤；
+- `extended_trades.csv`：每笔实际延长持仓及最终退出原因；
+- 变体逐笔、容量审计和账户账本文件。
 
-## Decision rule
+## 决策规则与已选结果
 
-Consider production work only if the variant improves the final chronological 20% after costs, does not materially worsen realized drawdown, and is not supported only by one calendar year or one trade. Capacity cost is reported as the number of signals selected in the baseline but no longer selected by the variant.
+仅当变体在计入成本后改善最终时间顺序 20% 时段、不实质恶化已实现回撤，且改善不只来自单一年份或单笔交易时，才考虑执行层实现。容量成本记录为：基线选中、但变体不再选中的信号数。
 
-This study uses the frozen historical research entry convention. It does not change the separate, already accepted immediate-market-entry convention used by the live testnet engine.
+24h 是已测试上限中的选定候选，完整对比见 [`CAP_COMPARISON.md`](CAP_COMPARISON.md)。本研究使用冻结历史研究的下一分钟入场约定；它不改变测试网执行层已接受的即时市价入场约定。

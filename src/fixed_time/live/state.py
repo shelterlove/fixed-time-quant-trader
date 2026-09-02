@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
@@ -10,6 +11,76 @@ from typing import Any, Iterator
 
 class StateError(RuntimeError):
     pass
+
+
+class RuntimeLock:
+    """An advisory, process-lifetime lock for a live runtime database.
+
+    The dashboard opens the database read-only and intentionally does not take
+    this lock.  Commands that can change the trading ledger take it so a
+    second trader (or a seed/smoke command) cannot operate on the same account
+    state concurrently.  The operating-system lock is released automatically
+    if the owning process dies.
+    """
+
+    def __init__(self, database_path: Path):
+        self.path = database_path.with_suffix(f"{database_path.suffix}.lock")
+        self._handle: Any | None = None
+        self._platform: str | None = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._platform = "fcntl"
+            except ImportError:
+                import msvcrt
+
+                handle.seek(0)
+                if not handle.read(1):
+                    handle.seek(0)
+                    handle.write(" ")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                self._platform = "msvcrt"
+        except (BlockingIOError, OSError) as exc:
+            handle.close()
+            raise StateError(f"live runtime is already locked: {self.path}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started_at={_utc_now()}\n")
+        handle.flush()
+        self._handle = handle
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if self._platform == "fcntl":
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            elif self._platform == "msvcrt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._handle.close()
+            self._handle = None
+            self._platform = None
+
+    def __enter__(self) -> "RuntimeLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
 
 
 def _utc_now() -> str:

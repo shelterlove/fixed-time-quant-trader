@@ -1,26 +1,26 @@
-# Latest result: recent-protection extension (48h)
+# 已选结果：近期保护激活后的 24h 延长
 
-This is a research result only. It has not changed the testnet trader, P90 history, production code, or deployment configuration.
+这是独立研究的选定候选，不改变冻结研究基线 `strategy.toml`。该规则已自代码发布 `v1.3.4` 起实现到测试网执行层；实时行为以 [`../../LIVE_EXTENSION.md`](../../LIVE_EXTENSION.md) 为准。
 
-## Frozen inputs
+## 固定输入
 
-- Code release: `v1.3.3`; frozen strategy configuration: `1.1.0`.
-- Historical research window: 2022-01-01 through 2026-07-01 UTC.
-- Baseline: 1,922 long candidates, 502 short candidates, and the existing unified five-unit portfolio replay.
-- Variant: a long is extended only if it normally reaches its planned exit and first activates protection in the preceding four hours. It remains subject to the existing hard stop and frozen P90 protection, with a forced exit after 48 additional hours.
-- When a new long needs capacity, open shorts are still evicted from worse to better priority first. Only if more capacity is required can an extended long that is already beyond `E + 4h` be closed; the oldest eligible extension gives way first.
+- 冻结策略配置：`1.1.0`。
+- 历史研究窗口：2022-01-01 至 2026-07-01 UTC。
+- 基线：1,922 个多头候选、502 个空头候选，使用既有统一五份资金组合回放。
+- 变体：仅当多头在原计划退出前四小时内首次激活保护，才延长；硬止损和既有 P90 保护保持不变；最长延长至 `E + 24h`。
+- 容量顺序：新多头先从差到好关闭空头；仍不足时，最早释放且已超过 `E + 4h` 的延长多头让位。
 
-## Result
+## 结果
 
-- 129 long candidates had both a normal planned exit and a completed base-shadow activation; 41 met the recent-activation condition and were actually extended.
-- Of those 41, 16 subsequently exited by P90 protection and 25 reached the 48-hour cap. Nine were closed early to admit later longs after short evictions had been exhausted. No extended trade hit its hard stop.
-- Full-sample final equity changed from `76,751.15` to `107,054.98` (+39.48% relative). Realized maximum drawdown changed from `-35.7052%` to `-36.0747%` (0.370 percentage points worse).
-- In the final chronological 20% of the research period, account return was `26.34x` for the baseline and `32.68x` for the variant; realized drawdown worsened to `-36.0747%`.
-- Eleven signals selected in the baseline were no longer selected under the variant. This is the observed capacity cost of holding the extensions longer.
-- The largest positive per-trade portfolio PnL difference was 19.34% of all positive PnL differences; the gain was not dominated by a single trade under this check.
+| 指标 | 冻结基线 | 24h 延长 |
+|---|---:|---:|
+| 最终权益 | 76,751.15 | 167,410.97 |
+| 最终时间顺序 20% 收益 | 2634.36% | 4553.23% |
+| 已实现最大回撤 | -35.705% | -35.780% |
+| 正收益月份比例 | 79.63% | 75.93% |
+| 基线选中但变体失去的信号 | 0 | 8 |
+| 延长持仓让位次数 | 0 | 3 |
 
-The reproducible local artifacts are ignored under `results/recent_protection_extension_48h/`. Re-run `python research/exit_protection_extension/run_experiment.py` to regenerate them.
+24h 在已测试上限中拥有最高最终权益与最终 20% 时段收益，回撤与 12h 相同。它在 2024 年低于基线，因此不应把单次历史结果当作未来预期；测试网阶段应记录真实成交、延长触发、P90 退出、上限退出和让位退出，再评估实际运行差异。
 
-## Interpretation
-
-Annual results are mixed: the variant trails in 2024 and 2025, while improving 2022, 2023, and the available 2026 period. It worsens realized drawdown, raises capacity cost, and is inferior to the already tested 24-hour variant. It is not the preferred candidate.
+完整的 12h / 24h / 48h 年度比较见 [`CAP_COMPARISON.md`](CAP_COMPARISON.md)。可复现的本地文件位于被 Git 忽略的 `research/exit_protection_extension/results/recent_protection_extension_24h/`。

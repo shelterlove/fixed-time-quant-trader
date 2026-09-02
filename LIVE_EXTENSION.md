@@ -1,42 +1,36 @@
-# Live 24-hour long-extension rule
+# 测试网 24h 多头延长规则
 
-This document applies only to the Binance Futures testnet execution layer. `strategy.toml` and the frozen historical research baseline remain unchanged.
+本规则只作用于 Binance USDⓈ-M Futures 测试网执行层。冻结研究基线 `strategy.toml` 不变；实时配置在 [`testnet.toml`](testnet.toml) 中被固定为 `4h / 24h / 4h`。
 
-## Rule
+## 触发与退出
 
-For a new live long position, the engine records the first completed minute that activates the existing +30% drawdown-protection state.
+对部署后新开的每个多头，程序记录首次进入既有 `+30%` 盈利保护状态的**已完成一分钟K线**。
 
-At its original planned exit `E`, the engine first processes every completed one-minute protection bar. It extends the long only when all of the following hold:
+到原计划退出时刻 `E`，程序先补齐并处理所有已完成的一分钟保护K线。只有同时满足下列条件，持仓才延长：
 
-1. P90 protection has not already exited it;
-2. the recorded first activation lies in `(E - 4h, E]`;
-3. the exchange-managed hard stop has not closed it.
+1. 尚未被 P90 保护退出；
+2. 首次保护激活时刻位于 `(E - 4h, E]`；
+3. 未被交易所托管的硬止损关闭。
 
-The extension changes the scheduled time exit to `E + 24h`. P90 protection continues minute-by-minute throughout the extension; the original exchange hard stop remains active. At `E + 24h`, any remaining position is closed by market order with reason `EXTENSION_CAP`.
+符合条件时，计划时间退出改为 `E + 24h`。延长期间：
 
-## Capacity order
+- 继续按已完成一分钟K线执行 P90 回撤保护；
+- 原交易所硬止损持续有效；
+- 到 `E + 24h` 仍未退出时，以市价单退出，原因为 `EXTENSION_CAP`。
 
-When a new long needs capacity, the engine closes positions in this order:
+延长持仓的退出不会写入 P90 训练历史；P90 仍只由基础影子候选更新。
 
-1. open shorts from worse to better priority;
-2. only if capacity is still insufficient, extended longs whose release time `E + 4h` is already past, oldest release first.
+## 容量顺序
 
-Normal longs and extensions that have not passed `E + 4h` are not displaced by this rule.
+若新多头需要容量，程序依次：
 
-## Upgrade behavior
+1. 按优先级从差到好关闭空头；
+2. 仍不足时，只关闭已经超过 `E + 4h` 释放时刻的延长多头，按最早释放时刻优先。
 
-The SQLite migration adds durable scheduling and activation fields. A position already open at the time of upgrade keeps its original scheduled exit. If it was already in protection, its first activation time is unknowable, so it is deliberately **not** extended. The rule applies fully to positions opened after deployment.
+普通多头，以及尚未超过 `E + 4h` 的延长多头，不会被这一规则让位关闭。
 
-## Testnet deployment
+## 升级行为
 
-Deploy only at a non-decision minute:
+SQLite 会迁移并保存计划退出、首次保护激活、延长状态、释放时刻和最终上限。升级时已开仓位保留原计划退出；若它已在保护状态但首次激活时间未知，程序不会延长它。完整规则只适用于升级后新开仓位。
 
-```bash
-cd ~/fixed-time-quant-trader
-git pull --ff-only
-git describe --tags --always
-./deploy.sh
-docker compose ps
-```
-
-The dashboard's current-position JSON now includes `scheduled_exit_time`, `protection_activated_at`, `extension_active`, `extension_release_time`, and `extension_deadline_time`.
+部署、升级和监控命令见 [`OPERATIONS.md`](OPERATIONS.md)。

@@ -110,9 +110,18 @@ def main() -> None:
     if args.command.startswith("live-"):
         from .live.config import load_live_config
         from .live.engine import LiveEngine
+        from .live.state import RuntimeLock
 
-        engine = LiveEngine(load_live_config(args.root))
+        live_config = load_live_config(args.root)
+        # These commands can write the durable trade state or submit orders.
+        # A read-only account check deliberately remains available while the
+        # trader is running.
+        lock = RuntimeLock(live_config.database_path) if args.command in {"live-run", "live-seed", "live-smoke"} else None
+        engine = None
         try:
+            if lock is not None:
+                lock.acquire()
+            engine = LiveEngine(live_config)
             if args.command == "live-check":
                 print(engine.check())
             elif args.command == "live-seed":
@@ -122,7 +131,10 @@ def main() -> None:
             else:
                 engine.run_forever()
         finally:
-            engine.close()
+            if engine is not None:
+                engine.close()
+            if lock is not None:
+                lock.release()
         return
     config = load_config()
     if args.command == "reconcile":

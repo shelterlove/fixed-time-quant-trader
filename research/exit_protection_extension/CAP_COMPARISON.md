@@ -1,30 +1,30 @@
-# 12h / 24h / 48h cap comparison
+# 12h / 24h / 48h 延长上限比较
 
-All three variants use the same frozen signals, P90 threshold, fees, slippage, funding treatment, unified five-unit portfolio, and the same priority rule: a new long first evicts shorts from worse to better priority, then may evict an extension only after `E + 4h`. Only the maximum extension time changes.
+三个变体使用完全相同的冻结信号、P90 阈值、费用、滑点、资金费处理、统一五份资金组合和容量优先级：新多头先从差到好关闭空头，仍不足时才可关闭已超过 `E + 4h` 的延长多头。唯一变化是最大延长时间。
 
-## Portfolio comparison
+## 组合比较
 
-| Maximum extension | Final equity | Final 20% return | Realized maximum drawdown | Positive-month ratio | Baseline-selected signals lost | Extension evictions |
+| 最大延长时间 | 最终权益 | 最终 20% 时段收益 | 已实现最大回撤 | 正收益月份比例 | 基线选中但变体失去的信号 | 延长持仓让位次数 |
 |---|---:|---:|---:|---:|---:|---:|
-| Baseline | 76,751.15 | 2634.36% | -35.705% | 79.63% | 0 | 0 |
+| 基线 | 76,751.15 | 2634.36% | -35.705% | 79.63% | 0 | 0 |
 | 12h | 113,721.28 | 4497.43% | -35.780% | 75.93% | 8 | 3 |
 | 24h | 167,410.97 | 4553.23% | -35.780% | 75.93% | 8 | 3 |
 | 48h | 107,054.98 | 3267.89% | -36.075% | 75.93% | 11 | 9 |
 
-## Calendar-year return comparison
+## 自然年收益比较
 
-| Year | Baseline | 12h | 24h | 48h |
+| 年份 | 基线 | 12h | 24h | 48h |
 |---|---:|---:|---:|---:|
 | 2022 | 358.27% | 355.20% | 399.41% | 409.84% |
 | 2023 | 820.68% | 848.63% | 1218.73% | 1051.78% |
 | 2024 | 997.72% | 845.19% | 801.39% | 793.19% |
 | 2025 | 2445.45% | 2859.23% | 2658.46% | 2406.09% |
-| 2026 through June | 551.03% | 841.55% | 922.34% | 714.46% |
+| 2026（截至 6 月） | 551.03% | 841.55% | 922.34% | 714.46% |
 
-## Decision
+## 结论
 
-`24h` is the preferred cap among the tested choices. It has the highest final equity and final-20%-period return, the same drawdown and capacity cost as 12h, and beats the baseline in every available calendar year except 2024.
+`24h` 是已测试上限中的首选：它拥有最高最终权益和最终 20% 时段收益，与 12h 有相同的回撤和容量成本；除 2024 年外，其余可用自然年均优于基线。
 
-`48h` is a useful negative result: extending beyond 24h lowers final equity and final-period return, adds six more extension evictions and three more displaced baseline signals, worsens drawdown, and also trails the baseline in 2025. Do not test longer fixed caps without a new hypothesis.
+`48h` 是有价值的反例：相较 24h，它降低最终权益和最终时段收益，多出六次延长持仓让位和三次基线信号损失，回撤更差，并且在 2025 年落后于基线。没有新的假设时，不再测试更长的固定上限。
 
-This selects a research candidate only. It does not authorize or implement a testnet strategy change.
+此研究结论已在代码发布 `v1.3.4` 起作为测试网执行层的固定 24h 延长规则实现；冻结研究基线 `strategy.toml` 不变。实时精确定义见 [`../../LIVE_EXTENSION.md`](../../LIVE_EXTENSION.md)。
