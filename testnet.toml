@@ -21,7 +21,7 @@ evict_after_hours = 4
 [runtime]
 account_poll_seconds = 5
 idle_reconcile_seconds = 60
-decision_deadline_seconds = 60
+decision_deadline_seconds = 120
 request_timeout_seconds = 10
 max_attempts = 3
 max_concurrent_market_requests = 8

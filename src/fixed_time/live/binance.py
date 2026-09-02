@@ -101,16 +101,33 @@ class BinanceRest:
             raise BinanceError("invalid exchangeInfo response")
         return result
 
-    def tradable_symbols(self) -> list[str]:
-        return sorted(
-            item["symbol"] for item in self.exchange_info()["symbols"]
+    def trading_exchange_info(self) -> dict[str, Any]:
+        """Return the public contract catalogue of the configured testnet."""
+        result = self._request("GET", self.config.trading_base_url, "/fapi/v1/exchangeInfo")
+        if not isinstance(result, dict) or not isinstance(result.get("symbols"), list):
+            raise BinanceError("invalid testnet exchangeInfo response")
+        return result
+
+    @staticmethod
+    def _perpetual_usdt_symbols(exchange_info: dict[str, Any]) -> set[str]:
+        return {
+            str(item["symbol"])
+            for item in exchange_info["symbols"]
             if item.get("quoteAsset") == "USDT" and item.get("contractType") == "PERPETUAL" and item.get("status") == "TRADING"
-        )
+        }
+
+    def tradable_symbols(self) -> list[str]:
+        """Symbols with public price history that can also be ordered on testnet."""
+        public = self._perpetual_usdt_symbols(self.exchange_info())
+        testnet = self._perpetual_usdt_symbols(self.trading_exchange_info())
+        return sorted(public & testnet)
 
     def symbol_filters(self, symbol: str) -> dict[str, Decimal]:
-        entry = next((item for item in self.exchange_info()["symbols"] if item.get("symbol") == symbol), None)
+        # Quantity and stop-price filters must be those accepted by the venue
+        # that receives the order, rather than the public-data venue.
+        entry = next((item for item in self.trading_exchange_info()["symbols"] if item.get("symbol") == symbol), None)
         if entry is None:
-            raise BinanceError(f"unknown symbol {symbol}")
+            raise BinanceError(f"unknown testnet symbol {symbol}")
         filters = {item["filterType"]: item for item in entry.get("filters", [])}
         try:
             lot = filters["LOT_SIZE"]

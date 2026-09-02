@@ -66,7 +66,9 @@ docker compose exec trader python -m fixed_time.cli live-health --root /app
 docker compose run --rm trader python -m fixed_time.cli live-check --root /app
 ```
 
-`trader` 每 5 秒轮询账户与持仓；至少每 60 秒进行一次完整对账。仪表盘每 5 秒刷新，健康检查要求心跳不超过 30 秒。
+`trader` 每 5 秒轮询账户与持仓；至少每 60 秒进行一次完整对账。决策时点允许最多 120 秒完成固定的全市场小时行情读取；仪表盘每 5 秒刷新，健康检查要求心跳不超过 30 秒。
+
+实时信号只从“正式网可读取行情且测试网实际支持下单”的 USDT 永续合约交集生成。测试网未上线或暂停的正式网合约会在候选生成前排除，不会发送无效订单。
 
 ## 单实例与状态文件
 

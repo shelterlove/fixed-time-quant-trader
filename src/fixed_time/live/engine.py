@@ -594,6 +594,16 @@ class LiveEngine:
             reconciled=reconciled, error=error,
         )
 
+    def _due_decision_time(self, now: datetime) -> datetime | None:
+        """Return the current hour's decision time while its collection window is open."""
+        decision_time = now.replace(minute=0, second=0, microsecond=0)
+        decision_hours = self.config.strategy.values["features"]["strategy_decision_hours_utc"]
+        if decision_time.hour not in decision_hours:
+            return None
+        if now < decision_time or now >= decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
+            return None
+        return decision_time
+
     def run_forever(self) -> None:
         self.check()
         next_poll = self._now()
@@ -618,11 +628,12 @@ class LiveEngine:
                         next_poll = now + timedelta(seconds=self.config.account_poll_seconds)
                         if full_reconcile:
                             next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
-                    if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
+                    decision_time = self._due_decision_time(now)
+                    if decision_time is not None:
                         self._sync_clock()
                         now = self._now()
-                        if now.minute == 0 and now.second < self.config.decision_deadline_seconds:
-                            self.process_decision(now.replace(second=0, microsecond=0))
+                        if self._due_decision_time(now) == decision_time:
+                            self.process_decision(decision_time)
                             next_full_reconcile = now + timedelta(seconds=self.config.idle_reconcile_seconds)
                     failures = 0
                     self._stop_requested.wait(1)

@@ -26,7 +26,7 @@ def _config(tmp_path: Path) -> LiveConfig:
         root=ROOT, strategy=load_config(ROOT), market_data_base_url="https://fapi.binance.com",
         trading_base_url="https://demo-fapi.binance.com", api_key="key", api_secret="secret", trading_enabled=True,
         database_path=tmp_path / "runtime.sqlite3",
-        long_extension=LongExtensionConfig(True, 4, 24, 4), account_poll_seconds=5, idle_reconcile_seconds=60, decision_deadline_seconds=60,
+        long_extension=LongExtensionConfig(True, 4, 24, 4), account_poll_seconds=5, idle_reconcile_seconds=60, decision_deadline_seconds=120,
         request_timeout_seconds=1, max_attempts=3, max_concurrent_market_requests=1,
     )
 
@@ -218,6 +218,41 @@ def test_private_production_request_is_rejected(tmp_path: Path) -> None:
     client = BinanceRest(_config(tmp_path), transport=lambda *_: {})
     with pytest.raises(BinanceError, match="restricted"):
         client._request("GET", "https://fapi.binance.com", "/fapi/v1/account", signed=True)
+
+
+def test_tradable_symbols_are_the_public_and_testnet_intersection(tmp_path: Path) -> None:
+    public = {
+        "symbols": [
+            {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+            {"symbol": "UAIUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+        ]
+    }
+    testnet = {
+        "symbols": [
+            {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+            {"symbol": "PAUSEDUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "BREAK"},
+        ]
+    }
+
+    def transport(_method, url, _params, _headers, _timeout):
+        return testnet if url.startswith("https://demo-fapi.binance.com") else public
+
+    assert BinanceRest(_config(tmp_path), transport=transport).tradable_symbols() == ["BTCUSDT"]
+
+
+def test_order_filters_come_from_testnet(tmp_path: Path) -> None:
+    public = {"symbols": [{"symbol": "BTCUSDT", "filters": []}]}
+    testnet = {"symbols": [{"symbol": "BTCUSDT", "filters": [
+        {"filterType": "LOT_SIZE", "stepSize": ".01", "minQty": ".01"},
+        {"filterType": "PRICE_FILTER", "tickSize": ".1"},
+        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+    ]}]}
+
+    def transport(_method, url, _params, _headers, _timeout):
+        return testnet if url.startswith("https://demo-fapi.binance.com") else public
+
+    filters = BinanceRest(_config(tmp_path), transport=transport).symbol_filters("BTCUSDT")
+    assert filters == {"step_size": Decimal(".01"), "min_qty": Decimal(".01"), "tick_size": Decimal(".1"), "min_notional": Decimal("5")}
 
 
 def test_market_post_is_not_retried_after_transport_error(tmp_path: Path) -> None:
@@ -626,9 +661,17 @@ def test_due_extension_closes_at_its_24_hour_cap(tmp_path: Path) -> None:
 def test_decision_deadline_uses_the_exchange_aligned_clock(tmp_path: Path) -> None:
     decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
     store = StateStore(tmp_path / "state.sqlite3")
-    engine = LiveEngine(_config(tmp_path), client=_ExchangeClockClient(decision + timedelta(seconds=61)), store=store)
+    engine = LiveEngine(_config(tmp_path), client=_ExchangeClockClient(decision + timedelta(seconds=121)), store=store)
     assert engine.process_decision(decision) == []
     assert store.decision_done(decision.isoformat())
+
+
+def test_decision_collection_window_includes_the_second_minute(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    engine = LiveEngine(_config(tmp_path), client=_ExchangeClockClient(decision), store=StateStore(tmp_path / "state.sqlite3"))
+    assert engine._due_decision_time(decision + timedelta(seconds=90)) == decision
+    assert engine._due_decision_time(decision + timedelta(seconds=120)) is None
+    assert engine._due_decision_time(decision.replace(hour=13) + timedelta(seconds=90)) is None
 
 
 def test_partial_exit_uses_a_new_persistent_client_order_id_for_the_remaining_position(tmp_path: Path) -> None:
