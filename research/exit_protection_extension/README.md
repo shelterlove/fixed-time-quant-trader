@@ -10,9 +10,9 @@ The extended position keeps the frozen hard-stop, P90 protection threshold, peak
 
 1. hard stop;
 2. P90 protection exit;
-3. `E + 24h` (`EXTENSION_CAP`).
+3. `E + 48h` (`EXTENSION_CAP`).
 
-When a later long needs capacity, the frozen long-priority sequence first evicts open shorts from worse to better priority. If capacity remains insufficient, it then closes an extended long only after that long has exceeded `E + 4h`, selecting the oldest eligible extension first. If no later long needs capacity, the extended long remains open until its normal protection exit or `E + 24h`.
+When a later long needs capacity, the frozen long-priority sequence first evicts open shorts from worse to better priority. If capacity remains insufficient, it then closes an extended long only after that long has exceeded `E + 4h`, selecting the oldest eligible extension first. If no later long needs capacity, the extended long remains open until its normal protection exit or `E + 48h`.
 
 Extended exits are not used as P90 training observations.
 
@@ -24,7 +24,7 @@ From the repository root, after the frozen research result and raw historical da
 python research/exit_protection_extension/run_experiment.py
 ```
 
-The run reads `results/local/research/` and writes only ignored files under `research/exit_protection_extension/results/recent_protection_extension_24h/`:
+The run reads `results/local/research/` and writes only ignored files under `research/exit_protection_extension/results/recent_protection_extension_48h/`:
 
 - `summary.json`: frozen inputs, rule, full-sample and final-20%-period metrics;
 - `comparison.csv`: baseline versus variant portfolio metrics;
