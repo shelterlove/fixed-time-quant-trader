@@ -420,6 +420,32 @@ class _DecisionClient(_RecoveryClient):
         return None
 
 
+class _LifecycleDecisionClient(_DecisionClient):
+    def __init__(self, now: datetime):
+        super().__init__(now)
+        self.exchange_positions: list[dict] = []
+        self.algo_orders: list[dict] = []
+
+    def market_order(self, symbol: str, side: str, position_side: str, quantity: Decimal, client_order_id: str) -> dict:
+        self.orders.append((symbol, side, position_side, quantity))
+        if position_side != "SHORT":
+            raise AssertionError("this lifecycle fixture only models a short")
+        if side == "SELL":
+            self.exchange_positions = [{"symbol": symbol, "positionSide": "SHORT", "positionAmt": format(-quantity, "f")}]
+        elif side == "BUY":
+            self.exchange_positions = []
+        else:
+            raise AssertionError(f"unexpected short order side: {side}")
+        return {"status": "FILLED", "executedQty": format(quantity, "f"), "avgPrice": "100"}
+
+    def stop_market(self, symbol: str, _side: str, _position_side: str, _trigger: Decimal, client_algo_id: str) -> dict:
+        self.algo_orders.append({"algoId": "lifecycle-stop", "clientAlgoId": client_algo_id, "symbol": symbol})
+        return {"algoId": "lifecycle-stop"}
+
+    def cancel_algo(self, _symbol: str, algo_id: str) -> None:
+        self.algo_orders = [order for order in self.algo_orders if order["algoId"] != algo_id]
+
+
 class _PartialCloseClient(_Client):
     def __init__(self):
         super().__init__()
@@ -746,7 +772,7 @@ def test_full_short_decision_path_filters_testnet_only_after_public_signal_ranki
     assert tuple(blocked_run) == (1, 0, "COMPLETE")
     assert blocked_client.orders == []
 
-    supported_client = _DecisionClient(decision)
+    supported_client = _LifecycleDecisionClient(decision)
     supported_client.market_data_symbols = lambda: symbols  # type: ignore[method-assign]
     supported_client.trading_symbols = lambda: symbols  # type: ignore[method-assign]
     supported_store = StateStore(tmp_path / "supported.sqlite3")
@@ -754,8 +780,14 @@ def test_full_short_decision_path_filters_testnet_only_after_public_signal_ranki
     admissions = supported.process_decision(decision, hourly=snapshot)
     assert [(item.candidate["strategy"], item.candidate["symbol"], item.units) for item in admissions] == [("short", "UAIUSDT", 1)]
     position = supported_store.open_positions()[0]
-    assert (position["symbol"], position["position_side"], position["stop_algo_id"]) == ("UAIUSDT", "SHORT", "recovered-stop")
+    assert (position["symbol"], position["position_side"], position["stop_algo_id"]) == ("UAIUSDT", "SHORT", "lifecycle-stop")
     assert [(symbol, side, position_side) for symbol, side, position_side, _ in supported_client.orders] == [("UAIUSDT", "SELL", "SHORT")]
+    supported.process_due_exits(decision + timedelta(hours=9))
+    assert supported_store.open_positions() == []
+    assert supported_client.exchange_positions == []
+    assert supported_client.algo_orders == []
+    exits = supported_store.connection.execute("SELECT role, reason FROM executions ORDER BY recorded_at").fetchall()
+    assert [tuple(row) for row in exits] == [("ENTRY", None), ("EXIT", "PLANNED_EXIT")]
 
 
 def test_decision_collection_window_includes_the_second_minute(tmp_path: Path) -> None:
