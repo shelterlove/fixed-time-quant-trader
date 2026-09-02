@@ -12,7 +12,7 @@ import polars as pl
 
 from fixed_time.config import load_config
 from fixed_time.live.binance import BinanceError, BinanceRest, quantize_down, stop_trigger_price
-from fixed_time.live.config import LiveConfig, load_live_config
+from fixed_time.live.config import LiveConfig, LongExtensionConfig, load_live_config
 from fixed_time.live.engine import LiveEngine
 from fixed_time.live.state import StateStore
 from fixed_time.live.strategy import Admission, allowed_retrace, long_protection_update, plan_admissions, unit_notional
@@ -25,7 +25,8 @@ def _config(tmp_path: Path) -> LiveConfig:
     return LiveConfig(
         root=ROOT, strategy=load_config(ROOT), market_data_base_url="https://fapi.binance.com",
         trading_base_url="https://demo-fapi.binance.com", api_key="key", api_secret="secret", trading_enabled=True,
-        database_path=tmp_path / "runtime.sqlite3", account_poll_seconds=5, idle_reconcile_seconds=60, decision_deadline_seconds=60,
+        database_path=tmp_path / "runtime.sqlite3",
+        long_extension=LongExtensionConfig(True, 4, 24, 4), account_poll_seconds=5, idle_reconcile_seconds=60, decision_deadline_seconds=60,
         request_timeout_seconds=1, max_attempts=3, max_concurrent_market_requests=1,
     )
 
@@ -39,10 +40,11 @@ def _candidate(strategy: str, symbol: str, time: datetime, priority: int = 1) ->
     }
 
 
-def _position(intent_id: str, strategy: str, symbol: str, units: int, priority: int, time: datetime) -> dict:
+def _position(intent_id: str, strategy: str, symbol: str, units: int, priority: int, time: datetime, **extra) -> dict:
     return {
         "intent_id": intent_id, "strategy": strategy, "symbol": symbol, "position_side": "LONG" if strategy == "long" else "SHORT",
         "units": units, "priority_score": priority, "decision_time": time.isoformat(),
+        **extra,
     }
 
 
@@ -54,6 +56,7 @@ def test_live_config_defaults_to_disabled(monkeypatch, tmp_path: Path) -> None:
     config = load_live_config(ROOT)
     assert config.trading_enabled is False
     assert config.trading_base_url == "https://demo-fapi.binance.com"
+    assert config.long_extension == LongExtensionConfig(True, 4, 24, 4)
 
 
 def test_state_preserves_logical_units(tmp_path: Path) -> None:
@@ -85,6 +88,26 @@ def test_state_migrates_existing_execution_ledger_without_losing_rows(tmp_path: 
     row = store.connection.execute("SELECT client_order_id, recorded_at FROM executions WHERE client_order_id = 'old'").fetchone()
     assert "executed_at" in columns
     assert tuple(row) == ("old", "2026-09-01T00:00:00+00:00")
+
+
+def test_state_migrates_existing_positions_to_the_original_scheduled_exit(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("""CREATE TABLE positions (
+        intent_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy TEXT NOT NULL, position_side TEXT NOT NULL,
+        units INTEGER NOT NULL, quantity TEXT NOT NULL, entry_price TEXT NOT NULL, planned_exit_time TEXT NOT NULL,
+        stop_algo_id TEXT, protection_active INTEGER NOT NULL DEFAULT 0, protection_peak TEXT,
+        protection_allowed_retrace REAL, protection_last_bar_time TEXT, status TEXT NOT NULL,
+        opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    planned = "2026-09-02T08:01:00+00:00"
+    connection.execute("INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       ("legacy", "AAAUSDT", "long", "LONG", 1, ".1", "100", planned, "stop", 1, "130", .3, planned, "OPEN", planned, planned))
+    connection.commit()
+    connection.close()
+    store = StateStore(path)
+    row = store.connection.execute("SELECT scheduled_exit_time, protection_activated_at, extension_active FROM positions WHERE intent_id = 'legacy'").fetchone()
+    assert tuple(row) == (planned, None, 0)
 
 
 def test_seeded_shadow_history_is_idempotent(tmp_path: Path) -> None:
@@ -138,6 +161,20 @@ def test_long_evicts_worst_short_to_make_capacity(tmp_path: Path) -> None:
     admissions = plan_admissions([_candidate("long", "NEWUSDT", time)], positions, config)
     assert admissions[0].units == 2
     assert admissions[0].evict_intent_ids == ("s2",)
+
+
+def test_long_evicts_shorts_before_a_post_four_hour_extension(tmp_path: Path) -> None:
+    config = _config(tmp_path).strategy
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    positions = [
+        _position("short", "short", "SUSDT", 1, 20, time),
+        _position("regular", "long", "RUSDT", 2, 1, time),
+        _position("extended", "long", "EUSDT", 2, 1, time - timedelta(hours=8), extension_active=1,
+                  extension_release_time=(time - timedelta(minutes=1)).isoformat()),
+    ]
+    admissions = plan_admissions([_candidate("long", "NEWUSDT", time)], positions, config)
+    assert admissions[0].units == 2
+    assert admissions[0].evict_intent_ids == ("short", "extended")
 
 
 def test_dynamic_unit_notional_and_p90_fallback(tmp_path: Path) -> None:
@@ -525,6 +562,52 @@ def test_long_protection_replays_every_unprocessed_completed_minute_after_a_gap(
     assert store.open_positions() == []
     assert [(side, position_side) for _, side, position_side, _ in client.orders] == [("SELL", "LONG")]
     assert client.requests == [{"start_time": time + timedelta(minutes=1), "end_time": time + timedelta(minutes=4, milliseconds=-1)}]
+
+
+def test_long_protection_uses_the_following_bar_after_activation_during_catchup(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "activate-then-exit", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": time.isoformat(),
+                         "planned_exit_time": (time + timedelta(hours=1)).isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "activate-then-exit"})
+    store.open_position("activate-then-exit", ".1", "100", .1, "stop")
+    frame = pl.DataFrame([
+        {"symbol": "AAAUSDT", "open_time": time, "open": 100., "high": 130., "low": 100., "close": 125., "quote_volume": 1., "trade_count": 1},
+        {"symbol": "AAAUSDT", "open_time": time + timedelta(minutes=1), "open": 120., "high": 129., "low": 110., "close": 112., "quote_volume": 1., "trade_count": 1},
+    ])
+    engine = LiveEngine(config, client=_CatchupProtectionClient(frame), store=store)
+    engine.process_long_protection(time + timedelta(minutes=2))
+    assert store.open_positions() == []
+
+
+def test_due_long_extends_only_after_a_recent_persisted_activation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    planned = datetime(2026, 9, 2, 8, 1, tzinfo=UTC)
+    store.create_intent({"intent_id": "extend", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": (planned - timedelta(hours=18)).isoformat(),
+                         "planned_exit_time": planned.isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "extend"})
+    store.open_position("extend", ".1", "100", .1, "stop")
+    store.update_protection("extend", True, "130", (planned - timedelta(minutes=1)).isoformat(), (planned - timedelta(hours=1)).isoformat())
+    LiveEngine(config, client=_Client(), store=store).process_due_exits(planned)
+    position = store.open_positions()[0]
+    assert position["extension_active"] == 1
+    assert position["extension_release_time"] == (planned + timedelta(hours=4)).isoformat()
+    assert position["scheduled_exit_time"] == (planned + timedelta(hours=24)).isoformat()
+
+
+def test_due_extension_closes_at_its_24_hour_cap(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    planned = datetime(2026, 9, 2, 8, 1, tzinfo=UTC)
+    store.create_intent({"intent_id": "cap", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG", "decision_time": (planned - timedelta(hours=18)).isoformat(),
+                         "planned_exit_time": planned.isoformat(), "units": 1, "priority_score": 1.0, "client_order_id": "cap"})
+    store.open_position("cap", ".1", "100", .1, "stop")
+    store.activate_extension("cap", (planned + timedelta(hours=24)).isoformat(), (planned + timedelta(hours=4)).isoformat())
+    engine = LiveEngine(config, client=_Client(), store=store)
+    engine.process_due_exits(planned + timedelta(hours=24))
+    assert store.open_positions() == []
+    reason = store.connection.execute("SELECT reason FROM executions WHERE intent_id = 'cap' AND role = 'EXIT'").fetchone()[0]
+    assert reason == "EXTENSION_CAP"
 
 
 def test_decision_deadline_uses_the_exchange_aligned_clock(tmp_path: Path) -> None:

@@ -13,6 +13,14 @@ TESTNET_FUTURES_URL = "https://demo-fapi.binance.com"
 
 
 @dataclass(frozen=True)
+class LongExtensionConfig:
+    enabled: bool
+    activation_lookback_hours: int
+    maximum_extension_hours: int
+    evict_after_hours: int
+
+
+@dataclass(frozen=True)
 class LiveConfig:
     root: Path
     strategy: StrategyConfig
@@ -22,6 +30,7 @@ class LiveConfig:
     api_secret: str
     trading_enabled: bool
     database_path: Path
+    long_extension: LongExtensionConfig
     account_poll_seconds: int
     idle_reconcile_seconds: int
     decision_deadline_seconds: int
@@ -73,10 +82,10 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
             values = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"cannot read testnet.toml: {exc}") from exc
-    expected = {"environment", "account", "runtime"}
+    expected = {"environment", "account", "long_extension", "runtime"}
     if set(values) != expected:
         raise ConfigError("testnet.toml must contain environment, account, and runtime")
-    environment, account, runtime = values["environment"], values["account"], values["runtime"]
+    environment, account, extension, runtime = values["environment"], values["account"], values["long_extension"], values["runtime"]
     if environment != {
         "market_data_base_url": PUBLIC_FUTURES_URL,
         "trading_base_url": TESTNET_FUTURES_URL,
@@ -85,6 +94,14 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         raise ConfigError("testnet environment URLs are fixed; signed production trading is not supported")
     if account != {"position_mode": "hedge", "margin_type": "isolated", "leverage": 1, "single_asset_mode": True}:
         raise ConfigError("only hedge, isolated, single-asset, 1x testnet execution is supported")
+    selected_extension = {
+        "enabled": True,
+        "activation_lookback_hours": 4,
+        "maximum_extension_hours": 24,
+        "evict_after_hours": 4,
+    }
+    if extension != selected_extension:
+        raise ConfigError("only the research-selected 4h/24h/4h long extension is supported")
     required_runtime = {"account_poll_seconds", "idle_reconcile_seconds", "decision_deadline_seconds", "request_timeout_seconds", "max_attempts", "max_concurrent_market_requests"}
     if set(runtime) != required_runtime or not all(isinstance(runtime[name], int) and runtime[name] > 0 for name in required_runtime):
         raise ConfigError("runtime settings must be positive integers")
@@ -107,6 +124,12 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         api_secret=secret or "",
         trading_enabled=enabled,
         database_path=(root_path / database).resolve(),
+        long_extension=LongExtensionConfig(
+            enabled=True,
+            activation_lookback_hours=4,
+            maximum_extension_hours=24,
+            evict_after_hours=4,
+        ),
         account_poll_seconds=poll_seconds,
         idle_reconcile_seconds=runtime["idle_reconcile_seconds"],
         decision_deadline_seconds=runtime["decision_deadline_seconds"],

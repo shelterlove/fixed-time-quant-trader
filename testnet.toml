@@ -11,6 +11,13 @@ margin_type = "isolated"
 leverage = 1
 single_asset_mode = true
 
+[long_extension]
+# Live-only, research-selected exit variant.  strategy.toml remains frozen.
+enabled = true
+activation_lookback_hours = 4
+maximum_extension_hours = 24
+evict_after_hours = 4
+
 [runtime]
 account_poll_seconds = 5
 idle_reconcile_seconds = 60

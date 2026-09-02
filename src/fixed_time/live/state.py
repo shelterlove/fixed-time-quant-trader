@@ -76,11 +76,16 @@ class StateStore:
                     quantity TEXT NOT NULL,
                     entry_price TEXT NOT NULL,
                     planned_exit_time TEXT NOT NULL,
+                    scheduled_exit_time TEXT NOT NULL,
                     stop_algo_id TEXT,
                     protection_active INTEGER NOT NULL DEFAULT 0,
                     protection_peak TEXT,
                     protection_allowed_retrace REAL,
                     protection_last_bar_time TEXT,
+                    protection_activated_at TEXT,
+                    extension_active INTEGER NOT NULL DEFAULT 0,
+                    extension_release_time TEXT,
+                    extension_deadline_time TEXT,
                     status TEXT NOT NULL,
                     opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -159,9 +164,15 @@ class StateStore:
                 ("protection_peak", "TEXT"),
                 ("protection_allowed_retrace", "REAL"),
                 ("protection_last_bar_time", "TEXT"),
+                ("scheduled_exit_time", "TEXT"),
+                ("protection_activated_at", "TEXT"),
+                ("extension_active", "INTEGER NOT NULL DEFAULT 0"),
+                ("extension_release_time", "TEXT"),
+                ("extension_deadline_time", "TEXT"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE positions ADD COLUMN {name} {declaration}")
+            connection.execute("UPDATE positions SET scheduled_exit_time = planned_exit_time WHERE scheduled_exit_time IS NULL")
             execution_columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
             if "executed_at" not in execution_columns:
                 connection.execute("ALTER TABLE executions ADD COLUMN executed_at TEXT")
@@ -268,11 +279,11 @@ class StateStore:
         with self.transaction() as connection:
             connection.execute(
                 """INSERT OR REPLACE INTO positions
-                   (intent_id, symbol, strategy, position_side, units, quantity, entry_price, planned_exit_time, stop_algo_id,
+                   (intent_id, symbol, strategy, position_side, units, quantity, entry_price, planned_exit_time, scheduled_exit_time, stop_algo_id,
                     protection_active, protection_peak, protection_allowed_retrace, status, opened_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'OPEN', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'OPEN', ?, ?)""",
                 (intent_id, intent["symbol"], intent["strategy"], intent["position_side"], intent["units"], quantity, entry_price,
-                 intent["planned_exit_time"], stop_algo_id, entry_price if intent["strategy"] == "long" else None, allowed_retrace, now, now),
+                 intent["planned_exit_time"], intent["planned_exit_time"], stop_algo_id, entry_price if intent["strategy"] == "long" else None, allowed_retrace, now, now),
             )
             connection.execute("UPDATE intents SET status = 'OPEN', updated_at = ? WHERE intent_id = ?", (now, intent_id))
 
@@ -282,16 +293,28 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise StateError(f"cannot add stop to {intent_id}")
 
-    def update_protection(self, intent_id: str, active: bool, peak: str, last_bar_time: str) -> None:
+    def update_protection(self, intent_id: str, active: bool, peak: str, last_bar_time: str, activated_at: str | None = None) -> None:
         with self.transaction() as connection:
             cursor = connection.execute(
                 """UPDATE positions
-                   SET protection_active = ?, protection_peak = ?, protection_last_bar_time = ?, updated_at = ?
+                   SET protection_active = ?, protection_peak = ?, protection_last_bar_time = ?,
+                       protection_activated_at = COALESCE(protection_activated_at, ?), updated_at = ?
                    WHERE intent_id = ? AND status = 'OPEN'""",
-                (int(active), peak, last_bar_time, _utc_now(), intent_id),
+                (int(active), peak, last_bar_time, activated_at, _utc_now(), intent_id),
             )
             if cursor.rowcount != 1:
                 raise StateError(f"cannot update protection for {intent_id}")
+
+    def activate_extension(self, intent_id: str, scheduled_exit_time: str, release_time: str) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE positions
+                   SET extension_active = 1, scheduled_exit_time = ?, extension_release_time = ?, extension_deadline_time = ?, updated_at = ?
+                   WHERE intent_id = ? AND status = 'OPEN' AND extension_active = 0""",
+                (scheduled_exit_time, release_time, scheduled_exit_time, _utc_now(), intent_id),
+            )
+            if cursor.rowcount != 1:
+                raise StateError(f"cannot activate extension for {intent_id}")
 
     def update_position_quantity(self, intent_id: str, quantity: str) -> None:
         with self.transaction() as connection:

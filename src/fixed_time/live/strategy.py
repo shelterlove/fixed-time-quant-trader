@@ -46,6 +46,21 @@ def _open_key(position: dict[str, Any]) -> tuple[str, str]:
     return str(position["strategy"]), str(position["symbol"])
 
 
+def _extension_eviction_candidates(simulated: list[dict[str, Any]], entry_time: datetime) -> list[dict[str, Any]]:
+    """A new long may displace only extensions held beyond their 4h release."""
+    eligible = []
+    for position in simulated:
+        release = position.get("extension_release_time")
+        if position.get("strategy") != "long" or not bool(position.get("extension_active")) or not release:
+            continue
+        release_time = release if isinstance(release, datetime) else datetime.fromisoformat(str(release))
+        if release_time < entry_time:
+            eligible.append(position)
+    return sorted(eligible, key=lambda position: (
+        position["extension_release_time"], position["decision_time"], position["symbol"],
+    ))
+
+
 def plan_admissions(candidates: list[dict[str, Any]], open_positions: list[dict[str, Any]], config: StrategyConfig) -> list[Admission]:
     """Frozen LONG_PRIORITY_SKIP capacity ordering without future-price assumptions."""
     rules, long_rules, short_rules = config.values["portfolio"], config.values["long"]["portfolio"], config.values["short"]["portfolio"]
@@ -65,6 +80,13 @@ def plan_admissions(candidates: list[dict[str, Any]], open_positions: list[dict[
                 key=lambda position: (-float(position["priority_score"]), position["decision_time"], position["symbol"]),
             )
             for victim in victims:
+                if free_units >= requested:
+                    break
+                simulated.remove(victim)
+                evictions.append(str(victim["intent_id"]))
+                free_units = rules["total_units"] - occupied()
+        if free_units < requested:
+            for victim in _extension_eviction_candidates(simulated, row["entry_time"]):
                 if free_units >= requested:
                     break
                 simulated.remove(victim)

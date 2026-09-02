@@ -337,7 +337,8 @@ class LiveEngine:
             for admission in admissions:
                 for victim_id in admission.evict_intent_ids:
                     victim = next(row for row in self.store.open_positions() if row["intent_id"] == victim_id)
-                    self._close(victim, "LONG_PRIORITY_EVICTION")
+                    reason = "LONG_EXTENSION_EVICTION" if victim["strategy"] == "long" and bool(victim.get("extension_active")) else "LONG_PRIORITY_EVICTION"
+                    self._close(victim, reason)
                 self._open(admission)
             self.store.mark_decision_done(decision_key)
             self.store.finish_decision(
@@ -353,8 +354,27 @@ class LiveEngine:
     def process_due_exits(self, now: datetime | None = None) -> None:
         now = now or self._now()
         for position in self.store.open_positions():
-            if datetime.fromisoformat(str(position["planned_exit_time"])) <= now:
-                self._close(position, "PLANNED_EXIT")
+            scheduled = datetime.fromisoformat(str(position["scheduled_exit_time"] or position["planned_exit_time"]))
+            if scheduled > now:
+                continue
+            if self._activate_extension_if_qualified(position, now):
+                continue
+            self._close(position, "EXTENSION_CAP" if bool(position.get("extension_active")) else "PLANNED_EXIT")
+
+    def _activate_extension_if_qualified(self, position: dict[str, Any], now: datetime) -> bool:
+        policy = self.config.long_extension
+        if not policy.enabled or position["strategy"] != "long" or bool(position.get("extension_active")):
+            return False
+        if not bool(position.get("protection_active")) or not position.get("protection_activated_at"):
+            return False
+        planned = datetime.fromisoformat(str(position["planned_exit_time"]))
+        activated = datetime.fromisoformat(str(position["protection_activated_at"]))
+        release = planned + timedelta(hours=policy.evict_after_hours)
+        deadline = planned + timedelta(hours=policy.maximum_extension_hours)
+        if now >= deadline or not planned - timedelta(hours=policy.activation_lookback_hours) < activated <= planned:
+            return False
+        self.store.activate_extension(str(position["intent_id"]), self._iso(deadline), self._iso(release))
+        return True
 
     def process_long_protection(self, now: datetime | None = None) -> None:
         now = now or self._now()
@@ -362,8 +382,19 @@ class LiveEngine:
             if position["strategy"] != "long":
                 continue
             for bar in self._unprocessed_protection_bars(position, now):
+                was_active = bool(position["protection_active"])
                 should_exit, active, peak = long_protection_update(position, bar, self.config.strategy)
-                self.store.update_protection(str(position["intent_id"]), active, format(peak, "f"), self._iso(bar["open_time"]))
+                activated_at = self._iso(bar["open_time"] + timedelta(minutes=1)) if active and not was_active else None
+                last_bar_time = self._iso(bar["open_time"])
+                self.store.update_protection(str(position["intent_id"]), active, format(peak, "f"), last_bar_time, activated_at)
+                # A delayed loop may process several completed bars at once.
+                # Keep the in-memory state aligned with the durable state so
+                # the bar immediately after activation can enforce P90.
+                position.update({
+                    "protection_active": int(active), "protection_peak": format(peak, "f"),
+                    "protection_last_bar_time": last_bar_time,
+                    "protection_activated_at": activated_at or position.get("protection_activated_at"),
+                })
                 if should_exit:
                     self._close(position, "PROTECTION")
                     break
@@ -580,8 +611,8 @@ class LiveEngine:
                     if now >= next_poll:
                         full_reconcile = now >= next_full_reconcile
                         self.reconcile(full=full_reconcile)
-                        self.process_due_exits(now)
                         self.process_long_protection(now)
+                        self.process_due_exits(now)
                         self.process_due_shadows(now)
                         self._heartbeat(reconciled=full_reconcile)
                         next_poll = now + timedelta(seconds=self.config.account_poll_seconds)
