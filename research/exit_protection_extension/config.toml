@@ -1,0 +1,6 @@
+[experiment]
+id = "recent_protection_extension_4h"
+source_window = "research"
+activation_lookback_hours = 4
+maximum_extension_hours = 4
+out_of_sample_fraction = 0.20
