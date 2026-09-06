@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 data/
 results/
+research/
 legacy_research/
 .venv/
 .env

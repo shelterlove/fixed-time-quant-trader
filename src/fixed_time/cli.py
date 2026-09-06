@@ -92,20 +92,31 @@ def main() -> None:
         return
     if args.command == "live-health":
         from datetime import UTC, datetime, timedelta
+        import sqlite3
         from .live.config import load_live_config
-        from .live.state import StateStore
 
         live_config = load_live_config(args.root)
         if not live_config.database_path.exists():
             raise ConfigError("live runtime database does not exist")
-        store = StateStore(live_config.database_path)
+        connection = sqlite3.connect(f"{live_config.database_path.as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
         try:
-            status = store.runtime_status()
+            status = connection.execute("SELECT * FROM runtime_status WHERE singleton = 1").fetchone()
         finally:
-            store.close()
+            connection.close()
         if status is None or datetime.fromisoformat(status["heartbeat_at"]) < datetime.now(UTC) - timedelta(seconds=30):
             raise ConfigError("live trader heartbeat is stale")
         print({"status": "healthy", "heartbeat_at": status["heartbeat_at"]})
+        return
+    if args.command == "live-check":
+        from .live.binance import BinanceRest
+        from .live.config import load_live_config
+
+        client = BinanceRest(load_live_config(args.root))
+        account = client.account_check()
+        for position in account["positions"]:
+            client.ensure_symbol_config(str(position["symbol"]))
+        print(account)
         return
     if args.command.startswith("live-"):
         from .live.config import load_live_config
@@ -116,15 +127,13 @@ def main() -> None:
         # These commands can write the durable trade state or submit orders.
         # A read-only account check deliberately remains available while the
         # trader is running.
-        lock = RuntimeLock(live_config.database_path) if args.command in {"live-run", "live-seed", "live-smoke"} else None
+        lock = RuntimeLock(live_config.database_path)
         engine = None
         try:
             if lock is not None:
                 lock.acquire()
             engine = LiveEngine(live_config)
-            if args.command == "live-check":
-                print(engine.check())
-            elif args.command == "live-seed":
+            if args.command == "live-seed":
                 print({"inserted_shadow_records": engine.seed_shadow_history()})
             elif args.command == "live-smoke":
                 print(engine.smoke_test(args.symbol))

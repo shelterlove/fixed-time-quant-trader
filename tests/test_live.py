@@ -14,9 +14,10 @@ import polars as pl
 from fixed_time.config import load_config
 from fixed_time.live.binance import BinanceError, BinanceRest, quantize_down, stop_trigger_price
 from fixed_time.live.config import LiveConfig, LongExtensionConfig, load_live_config
+from fixed_time.live.dashboard import read_status
 from fixed_time.live.engine import LiveEngine
 from fixed_time.live.state import RuntimeLock, StateError, StateStore
-from fixed_time.live.strategy import Admission, allowed_retrace, long_protection_update, plan_admissions, unit_notional
+from fixed_time.live.strategy import Admission, allowed_retrace, entry_notional, exposure_multiplier, long_protection_update, plan_admissions
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +29,7 @@ def _config(tmp_path: Path) -> LiveConfig:
         trading_base_url="https://demo-fapi.binance.com", api_key="key", api_secret="secret", trading_enabled=True,
         database_path=tmp_path / "runtime.sqlite3",
         long_extension=LongExtensionConfig(True, 4, 24, 4), account_poll_seconds=5, idle_reconcile_seconds=60, decision_deadline_seconds=120,
-        request_timeout_seconds=1, max_attempts=3, max_concurrent_market_requests=1,
+        request_timeout_seconds=1, max_attempts=3, max_concurrent_market_requests=1, leverage=2,
     )
 
 
@@ -132,6 +133,25 @@ def test_seeded_shadow_history_is_idempotent(tmp_path: Path) -> None:
     assert store.shadow_history_stats() == (1, 1)
 
 
+def test_exchange_trade_and_income_sync_is_idempotent(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    now = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "trade", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": now.isoformat(), "planned_exit_time": now.isoformat(), "units": 1,
+                         "priority_score": 1.0, "client_order_id": "entry"})
+    store.record_execution("trade", "entry", "ENTRY", {"orderId": 10, "status": "FILLED", "executedQty": "1", "avgPrice": "100"})
+    fill = {"symbol": "AAAUSDT", "id": 7, "orderId": 10, "positionSide": "LONG", "side": "BUY", "qty": "1",
+            "price": "100", "quoteQty": "100", "realizedPnl": "0", "commission": ".05", "commissionAsset": "USDT",
+            "time": int(now.timestamp() * 1000)}
+    income = {"incomeType": "FUNDING_FEE", "tranId": 8, "symbol": "AAAUSDT", "tradeId": "",
+              "income": ".1", "asset": "USDT", "time": int(now.timestamp() * 1000)}
+    assert store.record_trade_fills([fill]) == 1
+    assert store.record_trade_fills([fill]) == 0
+    assert store.record_income_events([income]) == 1
+    assert store.record_income_events([income]) == 0
+    assert store.usdt_income_between((now-timedelta(seconds=1)).isoformat(), now.isoformat()) == Decimal(".1")
+
+
 def test_live_seed_uses_packaged_history_when_research_outputs_are_absent(tmp_path: Path) -> None:
     seed_dir = tmp_path / "seed"
     seed_dir.mkdir()
@@ -170,11 +190,35 @@ def test_long_evicts_worst_short_to_make_capacity(tmp_path: Path) -> None:
     positions = [
         _position("s1", "short", "S1USDT", 1, 10, time),
         _position("s2", "short", "S2USDT", 1, 20, time),
-        _position("l1", "long", "L1USDT", 2, 1, time),
+        _position("s3", "short", "S3USDT", 1, 30, time),
     ]
     admissions = plan_admissions([_candidate("long", "NEWUSDT", time)], positions, config)
     assert admissions[0].units == 2
-    assert admissions[0].evict_intent_ids == ("s2",)
+    assert admissions[0].evict_intent_ids == ("s3", "s2")
+
+
+def test_strict_d3_uses_only_an_already_idle_unit_without_eviction(tmp_path: Path) -> None:
+    config = _config(tmp_path).strategy
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    positions = [
+        _position("long", "long", "HELDUSDT", 2, 1, time),
+    ]
+    admission = plan_admissions([_candidate("long", "NEWUSDT", time)], positions, config)[0]
+    assert admission.units == 1
+    assert admission.candidate["allocation_mode"] == "SINGLE_UNIT_FRAGMENT"
+    assert admission.evict_intent_ids == ()
+
+
+def test_strict_d3_can_use_one_unit_left_by_two_shorts(tmp_path: Path) -> None:
+    config = _config(tmp_path).strategy
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    positions = [
+        _position("s1", "short", "S1USDT", 1, 10, time),
+        _position("s2", "short", "S2USDT", 1, 20, time),
+    ]
+    admission = plan_admissions([_candidate("long", "NEWUSDT", time)], positions, config)[0]
+    assert admission.units == 1
+    assert admission.evict_intent_ids == ()
 
 
 def test_long_evicts_shorts_before_a_post_four_hour_extension(tmp_path: Path) -> None:
@@ -182,7 +226,6 @@ def test_long_evicts_shorts_before_a_post_four_hour_extension(tmp_path: Path) ->
     time = datetime(2026, 9, 1, 14, tzinfo=UTC)
     positions = [
         _position("short", "short", "SUSDT", 1, 20, time),
-        _position("regular", "long", "RUSDT", 2, 1, time),
         _position("extended", "long", "EUSDT", 2, 1, time - timedelta(hours=8), extension_active=1,
                   extension_release_time=(time - timedelta(minutes=1)).isoformat()),
     ]
@@ -191,9 +234,53 @@ def test_long_evicts_shorts_before_a_post_four_hour_extension(tmp_path: Path) ->
     assert admissions[0].evict_intent_ids == ("short", "extended")
 
 
-def test_dynamic_unit_notional_and_p90_fallback(tmp_path: Path) -> None:
+def test_infeasible_new_long_does_not_evict_existing_shorts(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    for index in range(3):
+        intent_id = f"short-{index}"
+        store.create_intent({"intent_id": intent_id, "strategy": "short", "symbol": f"S{index}USDT",
+                             "position_side": "SHORT", "decision_time": decision.isoformat(),
+                             "planned_exit_time": (decision+timedelta(hours=2)).isoformat(), "units": 1,
+                             "priority_score": float(index), "client_order_id": intent_id})
+        store.open_position(intent_id, "1", "100", stop_algo_id=f"stop-{index}")
+    client = _Client()
+    client.balance = lambda: Decimal("0")  # type: ignore[method-assign]
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    engine._now = lambda: decision
+    engine.reconcile = lambda: True  # type: ignore[method-assign]
+    store.record_equity_minute(decision.isoformat(), Decimal("100"), Decimal("0"), Decimal("100"), Decimal("100"), Decimal("0"))
+    candidate = dict(_candidate("long", "AAAUSDT", decision), testnet_eligible=True)
+
+    assert engine.process_decision(decision, collected=(["AAAUSDT"], [candidate], None)) == []
+    assert {row["intent_id"] for row in store.open_positions()} == {"short-0", "short-1", "short-2"}
+
+
+def test_reconciliation_block_still_records_long_shadow_candidate(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    engine = LiveEngine(_config(tmp_path), client=_Client(), store=store)
+    engine._now = lambda: decision
+    engine.reconcile = lambda: False  # type: ignore[method-assign]
+    candidate = dict(_candidate("long", "AAAUSDT", decision), testnet_eligible=True)
+
+    assert engine.process_decision(decision, collected=(["AAAUSDT"], [candidate], None)) == []
+    assert store.connection.execute("SELECT COUNT(*) FROM shadow_tasks").fetchone()[0] == 1
+    run = store.connection.execute("SELECT candidate_count, admission_count FROM decision_runs").fetchone()
+    assert tuple(run) == (1, 0)
+
+
+def test_drawdown_sizing_and_p90_fallback(tmp_path: Path) -> None:
     config = _config(tmp_path).strategy
-    assert unit_notional(Decimal("60"), 2, 2, config) == Decimal("40")
+    assert exposure_multiplier(Decimal(".24999"), config) == Decimal("1.0")
+    assert exposure_multiplier(Decimal(".25"), config) == Decimal("1.05")
+    assert exposure_multiplier(Decimal(".30"), config) == Decimal("1.10")
+    assert exposure_multiplier(Decimal(".35"), config) == Decimal("1.15")
+    assert exposure_multiplier(Decimal(".40"), config) == Decimal("1.20")
+    assert exposure_multiplier(Decimal(".45"), config) == Decimal("1.25")
+    assert exposure_multiplier(Decimal(".50"), config) == Decimal("1.30")
+    assert exposure_multiplier(Decimal(".90"), config) == Decimal("1.30")
+    assert entry_notional(Decimal("60"), 2, Decimal("1.1"), config) == Decimal("44.0")
     entry = datetime(2026, 9, 1, tzinfo=UTC)
     assert allowed_retrace([], entry, config) == pytest.approx(.3)
 
@@ -253,7 +340,7 @@ def test_order_filters_come_from_testnet(tmp_path: Path) -> None:
         return testnet if url.startswith("https://demo-fapi.binance.com") else public
 
     filters = BinanceRest(_config(tmp_path), transport=transport).symbol_filters("BTCUSDT")
-    assert filters == {"step_size": Decimal(".01"), "min_qty": Decimal(".01"), "tick_size": Decimal(".1"), "min_notional": Decimal("5")}
+    assert filters == {"max_qty": Decimal("Infinity"), "step_size": Decimal(".01"), "min_qty": Decimal(".01"), "tick_size": Decimal(".1"), "min_notional": Decimal("5")}
 
 
 def test_market_post_is_not_retried_after_transport_error(tmp_path: Path) -> None:
@@ -286,7 +373,7 @@ def test_minute_kline_query_can_request_an_exact_closed_interval(tmp_path: Path)
     }
 
 
-def test_configure_symbol_sets_isolated_one_x_only_when_needed(tmp_path: Path) -> None:
+def test_configure_symbol_sets_isolated_two_x_only_when_needed(tmp_path: Path) -> None:
     symbol_config_calls = 0
     paths: list[str] = []
 
@@ -295,13 +382,38 @@ def test_configure_symbol_sets_isolated_one_x_only_when_needed(tmp_path: Path) -
         paths.append(url)
         if url.endswith("/symbolConfig"):
             symbol_config_calls += 1
-            return [{"symbol": "AAAUSDT", "marginType": "crossed" if symbol_config_calls == 1 else "isolated", "leverage": 20 if symbol_config_calls == 1 else 1}]
+            return [{"symbol": "AAAUSDT", "marginType": "crossed" if symbol_config_calls == 1 else "isolated", "leverage": 20 if symbol_config_calls == 1 else 2}]
         return {"code": 200, "msg": "success"}
 
     client = BinanceRest(_config(tmp_path), transport=transport)
     client.configure_symbol("AAAUSDT")
     assert any(path.endswith("/marginType") for path in paths)
     assert any(path.endswith("/leverage") for path in paths)
+
+
+def test_completed_mark_and_wallet_queries_use_the_testnet_profile(tmp_path: Path) -> None:
+    minute_end = datetime(2026, 9, 1, 14, 1, tzinfo=UTC)
+    calls: list[tuple[str, str, dict[str, str], dict[str, str]]] = []
+
+    def transport(method, url, params, headers, _timeout):
+        calls.append((method, url, dict(params), dict(headers)))
+        if url.endswith("/fapi/v3/account"):
+            return {"assets": [{"asset": "USDT", "walletBalance": "123.45"}]}
+        if url.endswith("/fapi/v1/markPriceKlines"):
+            return [[int((minute_end - timedelta(minutes=1)).timestamp() * 1000), "0", "0", "0", "101.25"]]
+        raise AssertionError(url)
+
+    client = BinanceRest(_config(tmp_path), transport=transport)
+    assert client.wallet_balance() == Decimal("123.45")
+    assert client.mark_price_close("AAAUSDT", minute_end) == Decimal("101.25")
+    account_call, mark_call = calls
+    assert account_call[1].startswith("https://demo-fapi.binance.com") and "signature" in account_call[2]
+    assert mark_call[1].startswith("https://demo-fapi.binance.com")
+    assert mark_call[2] == {
+        "symbol": "AAAUSDT", "interval": "1m", "limit": "1",
+        "startTime": str(int((minute_end - timedelta(minutes=1)).timestamp() * 1000)),
+        "endTime": str(int((minute_end - timedelta(milliseconds=1)).timestamp() * 1000)),
+    }
 
 
 class _Client:
@@ -316,6 +428,9 @@ class _Client:
         self.ensure_symbol_config(symbol)
 
     def balance(self) -> Decimal:
+        return Decimal("100")
+
+    def wallet_balance(self) -> Decimal:
         return Decimal("100")
 
     def symbol_filters(self, symbol: str):
@@ -341,6 +456,194 @@ class _Client:
 
     def positions(self) -> list[dict]:
         return []
+
+
+class _EquityClient(_Client):
+    def __init__(self, marks: dict[datetime, Decimal]):
+        super().__init__()
+        self.marks = marks
+        self.mark_requests: list[datetime] = []
+
+    def wallet_balance(self) -> Decimal:
+        return Decimal("100")
+
+    def mark_price_close(self, _symbol: str, minute_end: datetime) -> Decimal:
+        self.mark_requests.append(minute_end)
+        return self.marks[minute_end]
+
+
+def test_completed_equity_persists_peak_idempotently_and_blocks_a_gap(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path)
+    first = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store.create_intent({"intent_id": "equity", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": first.isoformat(), "planned_exit_time": (first + timedelta(hours=1)).isoformat(),
+                         "units": 1, "priority_score": 1.0, "client_order_id": "equity"})
+    store.open_position("equity", "1", "100", .3, "stop", filled_at=(first - timedelta(minutes=1)).isoformat())
+    client = _EquityClient({
+        first: Decimal("120"), first + timedelta(minutes=1): Decimal("90"), first + timedelta(minutes=3): Decimal("90"),
+    })
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    first_row = engine._completed_equity(first)
+    assert (first_row["equity"], first_row["peak_equity"], first_row["drawdown"]) == ("120", "120", "0")
+    assert engine._completed_equity(first) == first_row
+    assert client.mark_requests == [first]
+
+    engine.close()
+    restarted = LiveEngine(_config(tmp_path), client=client, store=StateStore(path))
+    second = restarted._completed_equity(first + timedelta(minutes=1))
+    assert (second["equity"], second["peak_equity"], second["drawdown"]) == ("90", "120", "0.25")
+    assert restarted._sizing_snapshot(first + timedelta(minutes=1))["exposure_multiplier"] == "1.05"
+    restarted._completed_equity(first + timedelta(minutes=3))
+    assert [row["code"] for row in restarted.store.active_entry_blocks()] == ["EQUITY_GAP"]
+    assert restarted.store.latest_equity_minute()["minute_end"] == (first + timedelta(minutes=1)).isoformat()
+
+
+def test_completed_equity_repairs_a_short_restart_gap_when_marks_are_complete(tmp_path: Path) -> None:
+    first = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.create_intent({"intent_id": "equity", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": first.isoformat(), "planned_exit_time": (first+timedelta(hours=1)).isoformat(),
+                         "units": 1, "priority_score": 1.0, "client_order_id": "equity"})
+    store.open_position("equity", "1", "100", filled_at=(first-timedelta(minutes=1)).isoformat())
+    marks = {first+timedelta(minutes=offset): Decimal(str(100+offset)) for offset in range(4)}
+    engine = LiveEngine(_config(tmp_path), client=_EquityClient(marks), store=store)
+    engine._completed_equity(first)
+    repaired = engine._completed_equity(first+timedelta(minutes=3))
+    assert repaired["equity"] == "103"
+    assert store.connection.execute("SELECT COUNT(*) FROM equity_minutes").fetchone()[0] == 4
+    assert store.active_entry_blocks() == []
+
+
+def test_completed_equity_removes_post_cutoff_wallet_income(tmp_path: Path) -> None:
+    cutoff = datetime(2026, 9, 1, 14, tzinfo=UTC)
+
+    class IncomeClient(_Client):
+        def wallet_balance(self) -> Decimal:
+            return Decimal("110")
+        def user_trades(self, _symbol: str, **_kwargs):
+            return []
+        def income_history(self, **_kwargs):
+            return [{"incomeType": "TRANSFER", "tranId": 1, "symbol": "", "tradeId": "", "income": "10",
+                     "asset": "USDT", "time": int((cutoff+timedelta(seconds=20)).timestamp()*1000)}]
+
+    engine = LiveEngine(_config(tmp_path), client=IncomeClient(), store=StateStore(tmp_path / "state.sqlite3"))
+    engine._now = lambda: cutoff + timedelta(seconds=30)
+    row = engine._completed_equity(cutoff)
+    assert (row["wallet_balance"], row["equity"]) == ("100", "100")
+
+
+def test_position_at_minute_cutoff_is_rebuilt_from_exchange_execution_times(tmp_path: Path) -> None:
+    cutoff = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.create_intent({"intent_id": "trade", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": cutoff.isoformat(), "planned_exit_time": cutoff.isoformat(), "units": 1,
+                         "priority_score": 1.0, "client_order_id": "entry"})
+    store.record_execution("trade", "entry", "ENTRY", {"orderId": 1, "status": "FILLED", "executedQty": "1",
+                           "avgPrice": "100", "updateTime": int((cutoff-timedelta(seconds=10)).timestamp()*1000)})
+    store.open_position("trade", "1", "100")
+    store.record_execution("trade", "exit", "EXIT", {"orderId": 2, "status": "FILLED", "executedQty": "1",
+                           "avgPrice": "110", "updateTime": int((cutoff+timedelta(seconds=10)).timestamp()*1000)})
+    store.close_position("trade")
+    assert store.positions_at(cutoff.isoformat())[0]["quantity"] == Decimal("1")
+    assert store.positions_at((cutoff+timedelta(minutes=1)).isoformat()) == []
+
+
+def test_completed_equity_never_uses_a_live_price_as_a_historical_mark(tmp_path: Path) -> None:
+    first = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.create_intent({"intent_id": "held", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": first.isoformat(), "planned_exit_time": (first + timedelta(hours=1)).isoformat(),
+                         "units": 1, "priority_score": 1.0, "client_order_id": "held"})
+    store.open_position("held", ".1", "100", .3, "stop", filled_at=(first - timedelta(minutes=1)).isoformat())
+
+    class NoHistoricalMarkClient(_Client):
+        mark_price_close = None
+
+    with pytest.raises(StateError, match="completed mark-price"):
+        LiveEngine(_config(tmp_path), client=NoHistoricalMarkClient(), store=store)._completed_equity(first)
+
+
+def test_legacy_position_can_install_a_stop_without_a_two_x_reconfiguration(tmp_path: Path) -> None:
+    first = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.create_intent({"intent_id": "legacy", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": first.isoformat(), "planned_exit_time": (first + timedelta(hours=1)).isoformat(),
+                         "units": 1, "priority_score": 1.0, "client_order_id": "legacy"})
+    store.open_position("legacy", ".1", "100", .3)
+
+    class LegacyClient(_Client):
+        def ensure_symbol_config(self, _symbol: str) -> None:
+            raise AssertionError("stop recovery must not reconfigure a held position")
+
+    engine = LiveEngine(_config(tmp_path), client=LegacyClient(), store=store)
+    engine._install_stop(store.open_positions()[0])
+    assert store.open_positions()[0]["stop_algo_id"] == "99"
+
+
+def test_decision_batch_reuses_one_persisted_sizing_snapshot(tmp_path: Path) -> None:
+    decision = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    client = _DecisionClient(decision)
+    store = StateStore(tmp_path / "state.sqlite3")
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    candidates = [
+        dict(_candidate("long", "AAAUSDT", decision), testnet_eligible=True),
+        dict(_candidate("long", "BBBUSDT", decision, 2), testnet_eligible=True),
+    ]
+    admissions = engine.process_decision(decision, collected=(["AAAUSDT", "BBBUSDT"], candidates, None))
+    assert [item.units for item in admissions] == [1, 1]
+    positions = store.open_positions()
+    assert len(positions) == 2
+    assert {row["pre_entry_equity"] for row in positions} == {"100"}
+    assert {row["pre_entry_drawdown"] for row in positions} == {"0"}
+    assert {row["exposure_multiplier"] for row in positions} == {"1.0"}
+    assert len({row["target_notional"] for row in positions}) == 1
+    assert {Decimal(str(row["filled_notional"])) for row in positions} == {Decimal("33.2")}
+
+
+def test_configuration_failure_cannot_send_an_unprotected_entry(tmp_path: Path) -> None:
+    class ConfigurationFailureClient(_Client):
+        def configure_symbol(self, _symbol: str) -> None:
+            raise BinanceError("cannot set isolated 2x")
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    client = ConfigurationFailureClient()
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    with pytest.raises(BinanceError, match="isolated 2x"):
+        engine._open(Admission(_candidate("long", "AAAUSDT", datetime(2026, 9, 1, 14, tzinfo=UTC)), 2))
+    assert client.orders == []
+    assert store.pending_intents() == []
+
+
+def test_reconciliation_blocks_new_entries_on_existing_leverage_mismatch(tmp_path: Path) -> None:
+    class ConfigurationMismatchClient(_RecoveryClient):
+        def ensure_symbol_config(self, _symbol: str) -> None:
+            raise BinanceError("AAAUSDT must be isolated at 2x leverage")
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    time = datetime(2026, 9, 1, 14, tzinfo=UTC).isoformat()
+    store.create_intent({"intent_id": "legacy", "strategy": "long", "symbol": "AAAUSDT", "position_side": "LONG",
+                         "decision_time": time, "planned_exit_time": time, "units": 1, "priority_score": 1.0,
+                         "client_order_id": "legacy"})
+    store.open_position("legacy", ".1", "100", .3, "stop")
+    client = ConfigurationMismatchClient()
+    client.exchange_positions = [{"symbol": "AAAUSDT", "positionSide": "LONG", "positionAmt": ".1"}]
+    client.algo_orders = [{"symbol": "AAAUSDT", "algoId": "stop"}]
+    engine = LiveEngine(_config(tmp_path), client=client, store=store)
+    assert engine.reconcile() is False
+    assert store.active_entry_blocks()[0]["code"] == "ACCOUNT_CONFIGURATION"
+
+
+def test_entry_blocks_are_deduplicated_and_visible_to_the_dashboard(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path)
+    store.block_entry("UNKNOWN_EXCHANGE_POSITION", "unknown exchange positions: [('BTCUSDT', 'LONG')]")
+    store.block_entry("UNKNOWN_EXCHANGE_POSITION", "unknown exchange positions: [('BTCUSDT', 'LONG')]")
+    block = store.active_entry_blocks()[0]
+    assert (block["code"], block["occurrences"]) == ("UNKNOWN_EXCHANGE_POSITION", 2)
+    assert read_status(path)["active_blocks"][0]["code"] == "UNKNOWN_EXCHANGE_POSITION"
+    store.resolve_entry_block("UNKNOWN_EXCHANGE_POSITION")
+    assert store.active_entry_blocks() == []
 
 
 class _RecoveryClient(_Client):
@@ -516,6 +819,9 @@ class _SmokeFailureClient(_Client):
     def cancel_algo(self, _symbol: str, algo_id: str) -> None:
         self.cancelled.append(algo_id)
 
+    def cancel_order(self, _symbol: str, _client_id: str) -> dict:
+        return {"status": "CANCELED", "executedQty": "0", "avgPrice": "0"}
+
 
 class _MissingAverageSmokeClient(_Client):
     def __init__(self):
@@ -545,7 +851,7 @@ def test_entry_creates_exchange_stop_and_persistent_position(tmp_path: Path) -> 
     position = store.open_positions()[0]
     assert position["units"] == 2
     assert position["stop_algo_id"] == "99"
-    assert client.orders == [("AAAUSDT", "BUY", "LONG", Decimal(".4"))]
+    assert client.orders == [("AAAUSDT", "BUY", "LONG", Decimal(".664"))]
 
 
 def test_stop_setup_failure_flattens_filled_entry(tmp_path: Path) -> None:
@@ -725,9 +1031,9 @@ def test_decision_preserves_public_ranks_then_filters_unorderable_testnet_candid
     }])
     seen: list[str] = []
 
-    def candidates(snapshot, _decision_time, _config):
+    def candidates(snapshot, _decision_time, _config, **kwargs):
         seen.extend(snapshot.get_column("symbol").unique().sort().to_list())
-        return [_candidate("long", "UAIUSDT", decision)]
+        return [_candidate("long", "UAIUSDT", decision)], 0
 
     monkeypatch.setattr("fixed_time.live.engine.decision_candidates", candidates)
     assert engine.process_decision(decision, hourly=hourly) == []
@@ -807,7 +1113,7 @@ def test_partial_exit_uses_a_new_persistent_client_order_id_for_the_remaining_po
     store.open_position("partial", ".1", "100", .3, "stop-1")
     client = _PartialCloseClient()
     engine = LiveEngine(config, client=client, store=store)
-    with pytest.raises(BinanceError, match="did not fully fill"):
+    with pytest.raises(BinanceError, match="remains pending"):
         engine._close(store.open_positions()[0], "PLANNED_EXIT")
     assert store.open_positions()[0]["quantity"] == "0.05"
     engine._close(store.open_positions()[0], "PLANNED_EXIT")
@@ -818,12 +1124,12 @@ def test_partial_exit_uses_a_new_persistent_client_order_id_for_the_remaining_po
     assert [tuple(row) for row in attempts] == [(1, "PARTIAL"), (2, "SETTLED")]
 
 
-def test_smoke_failure_retries_same_exit_and_cancels_stop_after_cleanup(tmp_path: Path) -> None:
+def test_smoke_failure_settles_exit_and_cancels_stop_after_cleanup(tmp_path: Path) -> None:
     config = _config(tmp_path)
     client = _SmokeFailureClient()
     engine = LiveEngine(config, client=client, store=StateStore(tmp_path / "state.sqlite3"))
     engine.check = lambda: {"positions": [], "open_orders": [], "open_algo_orders": []}  # type: ignore[method-assign]
-    with pytest.raises(BinanceError, match="smoke exit did not fill"):
+    with pytest.raises(BinanceError, match="SMOKE_EXIT exit remains pending"):
         engine.smoke_test("AAAUSDT")
     assert client.sell_attempts == 2
     assert client.cancelled == ["99"]
@@ -836,5 +1142,5 @@ def test_smoke_fetches_average_price_before_creating_stop(tmp_path: Path) -> Non
     engine.check = lambda: {"positions": [], "open_orders": [], "open_algo_orders": []}  # type: ignore[method-assign]
     result = engine.smoke_test("AAAUSDT")
     assert result["entry_price"] == "100"
-    assert len(client.queries) == 1
+    assert len(client.queries) == 2  # Both entry and exit fills need an auditable price.
     assert client.cancelled == ["99"]

@@ -78,7 +78,7 @@ def select_short_hour(features_at_one_hour: pl.DataFrame, hour: int, rules: dict
     return eligible.with_columns(pl.col("symbol").cum_count().over("decision_time").alias("_selection_rank")).filter(pl.col("_selection_rank") <= rules["portfolio"]["max_positions_per_entry_hour"])
 
 
-def short_signals(features: pl.DataFrame, start: datetime, end_exclusive: datetime, config: StrategyConfig) -> pl.DataFrame:
+def short_signals(features: pl.DataFrame, start: datetime, end_exclusive: datetime, config: StrategyConfig, *, first_selected: dict | None = None) -> pl.DataFrame:
     rules, top_n = config.values["short"], config.values["universe"]["top_n"]
     first_hour, second_hour = rules["entry_hours_utc"]
     eligible_features = features.filter(
@@ -98,7 +98,9 @@ def short_signals(features: pl.DataFrame, start: datetime, end_exclusive: dateti
     for daily in daily_groups:
         first = select_short_hour(daily.filter(pl.col("decision_time").dt.hour() == first_hour), first_hour, rules, top_n)
         # 08:00 only sees remaining daily capacity after the frozen 06:00 result.
-        remaining = rules["portfolio"]["total_daily_units"] - first.height
+        day = daily.get_column("_day")[0]
+        count = first_selected.get(day, first.height) if first_selected is not None else first.height
+        remaining = rules["portfolio"]["total_daily_units"] - count
         second = select_short_hour(daily.filter(pl.col("decision_time").dt.hour() == second_hour), second_hour, rules, top_n).head(max(remaining, 0))
         day_frames.extend([first, second])
     selected = pl.concat(day_frames, how="diagonal_relaxed") if day_frames else eligible_features.with_columns(

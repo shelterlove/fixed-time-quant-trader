@@ -7,7 +7,7 @@ import pytest
 
 from fixed_time.config import load_config
 from fixed_time.execution import SHADOW_HISTORY_COLUMNS, execute_long_with_funding_diagnostics
-from fixed_time.pipeline import _research_shadow_history, _validate_signal_cache
+from fixed_time.pipeline import _minute_requirements_for_signals, _research_shadow_history, _validate_signal_cache
 from fixed_time.storage import empty_funding_frame
 
 
@@ -43,6 +43,14 @@ def test_signal_cache_validation_rejects_invalid_scope() -> None:
     frame = _signals().with_columns(pl.lit("unknown").alias("signal_scope"))
     with pytest.raises(ValueError, match="signal_scope"):
         _validate_signal_cache(frame, _meta(frame))
+
+
+def test_minute_requirements_ignore_strategy_specific_signal_columns() -> None:
+    long = _signals().with_columns(pl.lit(.3).alias("protection_allowed_retrace"))
+    short = _signals().with_columns(pl.lit("short").alias("short_only_reason"))
+    assert _minute_requirements_for_signals(long, short) == _minute_requirements_for_signals(long.select(
+        "symbol", "entry_time", "planned_exit_time"
+    ), short.select("symbol", "entry_time", "planned_exit_time"))
 
 
 def test_empty_funding_frame_supports_history_only_long_execution() -> None:

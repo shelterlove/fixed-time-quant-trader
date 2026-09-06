@@ -37,6 +37,7 @@ class LiveConfig:
     request_timeout_seconds: int
     max_attempts: int
     max_concurrent_market_requests: int
+    leverage: int
 
 
 def _bool(value: str | None, name: str, default: bool | None = None) -> bool:
@@ -92,14 +93,9 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         "trading_environment": "testnet",
     }:
         raise ConfigError("testnet environment URLs are fixed; signed production trading is not supported")
-    if account != {"position_mode": "hedge", "margin_type": "isolated", "leverage": 1, "single_asset_mode": True}:
-        raise ConfigError("only hedge, isolated, single-asset, 1x testnet execution is supported")
-    selected_extension = {
-        "enabled": True,
-        "activation_lookback_hours": 4,
-        "maximum_extension_hours": 24,
-        "evict_after_hours": 4,
-    }
+    if account != {"position_mode": "hedge", "margin_type": "isolated", "leverage": 2, "single_asset_mode": True}:
+        raise ConfigError("only hedge, isolated, single-asset, 2x testnet execution is supported")
+    selected_extension = {"enabled": True, **strategy.values["long"]["extension"]}
     if extension != selected_extension:
         raise ConfigError("only the research-selected 4h/24h/4h long extension is supported")
     required_runtime = {"account_poll_seconds", "idle_reconcile_seconds", "decision_deadline_seconds", "request_timeout_seconds", "max_attempts", "max_concurrent_market_requests"}
@@ -126,9 +122,7 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         database_path=(root_path / database).resolve(),
         long_extension=LongExtensionConfig(
             enabled=True,
-            activation_lookback_hours=4,
-            maximum_extension_hours=24,
-            evict_after_hours=4,
+            **strategy.values["long"]["extension"],
         ),
         account_poll_seconds=poll_seconds,
         idle_reconcile_seconds=runtime["idle_reconcile_seconds"],
@@ -136,4 +130,5 @@ def load_live_config(root: Path | str = ".") -> LiveConfig:
         request_timeout_seconds=runtime["request_timeout_seconds"],
         max_attempts=runtime["max_attempts"],
         max_concurrent_market_requests=runtime["max_concurrent_market_requests"],
+        leverage=2,
     )

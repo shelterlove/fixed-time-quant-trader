@@ -10,6 +10,7 @@ import polars as pl
 
 from ..config import StrategyConfig
 from ..features import build_features
+from ..portfolio import admitted_long_units
 from ..signals import long_signals, short_signals
 
 
@@ -20,8 +21,8 @@ class Admission:
     evict_intent_ids: tuple[str, ...] = ()
 
 
-def decision_candidates(hourly: pl.DataFrame, decision_time: datetime, config: StrategyConfig) -> list[dict[str, Any]]:
-    """Return frozen candidates at one timestamp; only live entry timing changes."""
+def decision_candidates(hourly: pl.DataFrame, decision_time: datetime, config: StrategyConfig, *, first_short_count: int | None = None) -> tuple[list[dict[str, Any]], int | None]:
+    """Compute frozen candidates and the 06:00 selection budget in one pass."""
     features = build_features(hourly, config)
     tomorrow = decision_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     rows: list[dict[str, Any]] = []
@@ -34,12 +35,15 @@ def decision_candidates(hourly: pl.DataFrame, decision_time: datetime, config: S
             rows.append(row)
     if decision_time.hour in config.values["short"]["entry_hours_utc"]:
         day_start = decision_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        short = short_signals(features, day_start, tomorrow, config).filter(pl.col("decision_time") == pl.lit(decision_time))
-        for row in short.to_dicts():
+        counts = {decision_time.date(): first_short_count} if first_short_count is not None else None
+        short = short_signals(features, day_start, tomorrow, config, first_selected=counts)
+        if first_short_count is None:
+            first_short_count = short.filter(pl.col("decision_time").dt.hour() == config.values["short"]["entry_hours_utc"][0]).height
+        for row in short.filter(pl.col("decision_time") == pl.lit(decision_time)).to_dicts():
             row["position_side"] = "SHORT"
             row["trade_id"] = f"live:{row['trade_id']}"
             rows.append(row)
-    return rows
+    return rows, first_short_count
 
 
 def _open_key(position: dict[str, Any]) -> tuple[str, str]:
@@ -61,6 +65,27 @@ def _extension_eviction_candidates(simulated: list[dict[str, Any]], entry_time: 
     ))
 
 
+def _long_victims(simulated: list[dict[str, Any]], requested: int, entry_time: datetime, total_units: int) -> list[dict[str, Any]] | None:
+    """Choose a complete, ordered eviction set without mutating the live plan."""
+    free_units = total_units - sum(int(position["units"]) for position in simulated)
+    victims: list[dict[str, Any]] = []
+    for pool in (
+        sorted(
+            (position for position in simulated if position["strategy"] == "short"),
+            key=lambda position: (-float(position["priority_score"]), position["decision_time"], position["symbol"]),
+        ),
+        _extension_eviction_candidates(simulated, entry_time),
+    ):
+        for victim in pool:
+            if free_units >= requested:
+                return victims
+            if victim in victims:
+                continue
+            victims.append(victim)
+            free_units += int(victim["units"])
+    return victims if free_units >= requested else None
+
+
 def plan_admissions(candidates: list[dict[str, Any]], open_positions: list[dict[str, Any]], config: StrategyConfig) -> list[Admission]:
     """Frozen LONG_PRIORITY_SKIP capacity ordering without future-price assumptions."""
     rules, long_rules, short_rules = config.values["portfolio"], config.values["long"]["portfolio"], config.values["short"]["portfolio"]
@@ -72,31 +97,26 @@ def plan_admissions(candidates: list[dict[str, Any]], open_positions: list[dict[
     eligible = [row for row in longs if ("long", row["symbol"]) not in open_keys()][:long_rules["max_positions_per_entry_time"]]
     requested = long_rules["single_signal_units"] if len(eligible) == 1 else long_rules["two_signal_units_each"]
     for row in eligible:
-        evictions: list[str] = []
+        victim_ids: tuple[str, ...] = ()
         free_units = rules["total_units"] - occupied()
-        if free_units < requested:
-            victims = sorted(
-                (position for position in simulated if position["strategy"] == "short"),
-                key=lambda position: (-float(position["priority_score"]), position["decision_time"], position["symbol"]),
-            )
+        actual_units = admitted_long_units(
+            requested, free_units, single_candidate=len(eligible) == 1,
+            strict_fragment=bool(long_rules["strict_idle_single_unit_fragment"]),
+        )
+        fragment = actual_units != requested
+        if free_units < actual_units:
+            victims = _long_victims(simulated, requested, row["entry_time"], rules["total_units"])
+            if victims is None:
+                continue
             for victim in victims:
-                if free_units >= requested:
-                    break
                 simulated.remove(victim)
-                evictions.append(str(victim["intent_id"]))
-                free_units = rules["total_units"] - occupied()
-        if free_units < requested:
-            for victim in _extension_eviction_candidates(simulated, row["entry_time"]):
-                if free_units >= requested:
-                    break
-                simulated.remove(victim)
-                evictions.append(str(victim["intent_id"]))
-                free_units = rules["total_units"] - occupied()
-        granted = min(requested, rules["total_units"] - occupied())
-        if granted > 0:
-            candidate = dict(row, units=granted)
-            simulated.append(candidate)
-            admissions.append(Admission(candidate, granted, tuple(evictions)))
+            victim_ids = tuple(str(victim["intent_id"]) for victim in victims)
+            free_units = rules["total_units"] - occupied()
+        if free_units < actual_units:
+            continue
+        candidate = dict(row, units=actual_units, allocation_mode="SINGLE_UNIT_FRAGMENT" if fragment else "STANDARD")
+        simulated.append(candidate)
+        admissions.append(Admission(candidate, actual_units, victim_ids))
     shorts = sorted((row for row in candidates if row["strategy"] == "short"), key=lambda row: (row["priority_order"], row["decision_time"], row["symbol"]))
     for row in shorts:
         if ("short", row["symbol"]) in open_keys():
@@ -111,15 +131,26 @@ def plan_admissions(candidates: list[dict[str, Any]], open_positions: list[dict[
     return admissions
 
 
-def unit_notional(safe_available_usdt: Decimal, occupied_units: int, requested_units: int, config: StrategyConfig) -> Decimal:
-    total = config.values["portfolio"]["total_units"]
-    free = total - occupied_units
-    if safe_available_usdt <= 0 or free <= 0 or requested_units <= 0 or requested_units > free:
+def exposure_multiplier(drawdown: Decimal, config: StrategyConfig) -> Decimal:
+    sizing = config.values["portfolio"]["drawdown_sizing"]
+    for tier in reversed(sizing["tiers"]):
+        if drawdown >= Decimal(str(tier["threshold"])):
+            return Decimal(str(tier["multiplier"]))
+    return Decimal(str(sizing["base_multiplier"]))
+
+
+def entry_notional(pre_entry_equity: Decimal, requested_units: int, multiplier: Decimal, config: StrategyConfig) -> Decimal:
+    total = int(config.values["portfolio"]["total_units"])
+    if pre_entry_equity <= 0 or requested_units <= 0 or requested_units > total or multiplier <= 0:
         return Decimal("0")
-    return safe_available_usdt / Decimal(free) * Decimal(requested_units)
+    return pre_entry_equity / Decimal(total) * Decimal(requested_units) * multiplier
 
 
 def allowed_retrace(history: list[dict[str, Any]], entry_time: datetime, config: StrategyConfig) -> float:
+    return protection_sample(history, entry_time, config)[0]
+
+
+def protection_sample(history: list[dict[str, Any]], entry_time: datetime, config: StrategyConfig) -> tuple[float, int, int]:
     rules = config.values["long"]["protection"]
     earliest = entry_time - timedelta(days=rules["window_days"])
     available = []
@@ -131,11 +162,11 @@ def allowed_retrace(history: list[dict[str, Any]], entry_time: datetime, config:
             if bool(row["shadow_activated"]) and row["shadow_max_retrace"] is not None:
                 activated.append(float(row["shadow_max_retrace"]))
     if len(available) < rules["minimum_history"] or len(activated) < rules["minimum_activated_history"]:
-        return float(rules["fallback_retrace"])
+        return float(rules["fallback_retrace"]), len(available), len(activated)
     ordered = sorted(activated)
     position = (len(ordered) - 1) * float(rules["retrace_quantile"])
     lower, upper = floor(position), min(floor(position) + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower), len(available), len(activated)
 
 
 def long_protection_update(position: dict[str, Any], minute_bar: dict[str, Any], config: StrategyConfig) -> tuple[bool, bool, Decimal]:

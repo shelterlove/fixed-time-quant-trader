@@ -20,13 +20,15 @@ services:
   dashboard:
     build: .
     command: ["python", "-m", "fixed_time.cli", "live-dashboard", "--root", "/app", "--host", "0.0.0.0", "--port", "8080"]
-    env_file: .env
+    environment:
+      DATABASE_PATH: /app/runtime/testnet.sqlite3
+      TRADING_ENABLED: "false"
     restart: unless-stopped
     depends_on:
       trader:
         condition: service_healthy
     volumes:
-      - ./runtime:/app/runtime
+      - ./runtime:/app/runtime:ro
     ports:
       - "8080:8080"
     healthcheck:

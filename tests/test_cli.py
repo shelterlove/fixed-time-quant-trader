@@ -43,3 +43,22 @@ def test_live_dashboard_defaults() -> None:
     parser = _parser()
     args = parser.parse_args(["live-dashboard"])
     assert (args.host, args.port) == ("0.0.0.0", 8080)
+
+
+@pytest.mark.parametrize("command", ["live-check", "live-health"])
+def test_live_read_commands_do_not_open_a_writable_state_store(monkeypatch, tmp_path, command):
+    from datetime import UTC, datetime
+    from fixed_time.live.state import StateStore
+    from test_live import _config
+
+    config = _config(tmp_path)
+    store = StateStore(config.database_path)
+    store.update_runtime_status("test", datetime.now(UTC).isoformat(), "100", 0, 0)
+    store.close()
+    monkeypatch.setattr("fixed_time.live.config.load_live_config", lambda root: config)
+    monkeypatch.setattr("fixed_time.live.binance.BinanceRest.account_check", lambda self: {"positions": [], "open_orders": [], "open_algo_orders": []})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read command opened writable state")
+    monkeypatch.setattr(StateStore, "__init__", forbidden)
+    monkeypatch.setattr(sys, "argv", ["fixed-time", command])
+    main()

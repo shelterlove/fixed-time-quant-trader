@@ -10,7 +10,8 @@ import polars as pl
 
 from .config import StrategyConfig, Window
 from .download import download_funding, download_hourly, download_minutes
-from .execution import SHADOW_HISTORY_COLUMNS, execute_long_with_funding_diagnostics, execute_short, funding_requirements, minute_requirements
+from .execution import (SHADOW_HISTORY_COLUMNS, execute_long_with_funding_diagnostics, execute_short,
+                        extend_long_trades, extension_requirements, funding_requirements, minute_requirements)
 from .features import build_features
 from .metrics import report_markdown, summarize
 from .portfolio import replay_long_standalone, replay_portfolio, replay_short_standalone
@@ -34,6 +35,14 @@ _SIGNAL_CACHE_REQUIRED_COLUMNS = {
     "entry_time", "planned_exit_time", "requested_units", "priority_score",
     "priority_order", "signal_scope",
 }
+
+_PATH_REQUIREMENT_COLUMNS = ["symbol", "entry_time", "planned_exit_time"]
+
+
+def _minute_requirements_for_signals(*frames: pl.DataFrame) -> set[tuple[str, datetime]]:
+    """Combine only the fields used to select causal minute-path partitions."""
+    paths = pl.concat([frame.select(_PATH_REQUIREMENT_COLUMNS) for frame in frames], how="vertical")
+    return minute_requirements(paths)
 
 
 def _cache_meta(config: StrategyConfig, window: Window, frame: pl.DataFrame) -> dict[str, Any]:
@@ -98,8 +107,8 @@ def _validate_signal_cache(frame: pl.DataFrame, meta: dict[str, Any]) -> None:
         raise ValueError("signals cache protection_history rows must be long")
 
 
-def _write_cache(config: StrategyConfig, window: Window, name: str, frame: pl.DataFrame) -> None:
-    directory = config.root / "data" / "cache" / window.id
+def _write_cache(config: StrategyConfig, window: Window, name: str, frame: pl.DataFrame, directory: Path | None = None) -> None:
+    directory = directory or config.root / "data" / "cache" / window.id
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"{name}.parquet"
     atomic_write_frame(target, frame)
@@ -134,7 +143,7 @@ def _history_long_signals(features: pl.DataFrame, window: Window, config: Strate
     )
 
 
-def prepare(config: StrategyConfig, window: Window) -> Prepared:
+def prepare(config: StrategyConfig, window: Window, *, cache_directory: Path | None = None) -> Prepared:
     feature_start = window.protection_history_start or window.start
     hourly = load_hourly(config.root, feature_start, window.end_exclusive, config.values["features"]["hourly_warmup_hours"])
     features = build_features(hourly, config)
@@ -142,13 +151,13 @@ def prepare(config: StrategyConfig, window: Window) -> Prepared:
     short = short_signals(features, window.start, window.end_exclusive, config)
     shadow_long = _history_long_signals(features, window, config, long)
     prior_shadow = _research_shadow_history(config, window)
-    _write_cache(config, window, "hourly_features", features)
+    _write_cache(config, window, "hourly_features", features, cache_directory)
     cached_signals = pl.concat([
         long.with_columns(pl.lit("window").alias("signal_scope")),
         short.with_columns(pl.lit("window").alias("signal_scope")),
         shadow_long.with_columns(pl.lit("protection_history").alias("signal_scope")),
     ], how="diagonal_relaxed")
-    _write_cache(config, window, "signals", cached_signals)
+    _write_cache(config, window, "signals", cached_signals, cache_directory)
     return Prepared(hourly, features, long, short, shadow_long, prior_shadow)
 
 
@@ -162,12 +171,13 @@ def _complete_from_signals(
     shadow_long_signals: pl.DataFrame,
     prior_shadow_history: pl.DataFrame,
     offline: bool,
+    output_directory: Path | None = None,
 ) -> dict[str, Any]:
     """Finish an already-frozen signal set without rebuilding its features."""
     long_execution_signals = long_signals_frame if shadow_long_signals.is_empty() else pl.concat(
         [shadow_long_signals, long_signals_frame], how="vertical_relaxed"
     )
-    minute_days = minute_requirements(long_execution_signals)
+    minute_days = _minute_requirements_for_signals(long_execution_signals, short_signals_frame)
     # Pre-window shadows seed only base-path protection history. Funding never
     # contributes to a base shadow and is therefore not downloaded for them.
     funding_months = funding_requirements(long_signals_frame)
@@ -183,12 +193,29 @@ def _complete_from_signals(
         long_execution_signals, minutes, funding, config, prior_shadow_history,
         window.start if not shadow_long_signals.is_empty() else None,
     )
+    extension_days, extension_months = extension_requirements(long_trades, config)
+    if extension_days:
+        extra_days, extra_months = extension_days - minute_days, extension_months - funding_months
+        if not offline:
+            if extra_days:
+                download_minutes(config, extra_days)
+            if extra_months:
+                download_funding(config, extra_months)
+        if extra_days:
+            minutes = pl.concat([minutes, load_minutes(config.root, extra_days)], how="vertical_relaxed").sort(["symbol", "open_time"])
+        if extra_months:
+            funding = pl.concat([funding, load_funding(config.root, extra_months)], how="vertical_relaxed").sort(["symbol", "funding_time"])
+        long_trades, extension_funding = extend_long_trades(long_trades, minutes, funding, config)
+        extended_ids = long_trades.filter(pl.col("extension_applied")).get_column("trade_id")
+        funding_event_detail = funding_event_detail.filter(~pl.col("trade_id").is_in(extended_ids))
+        if not extension_funding.is_empty():
+            funding_event_detail = pl.concat([funding_event_detail, extension_funding], how="vertical_relaxed").sort(["entry_time", "funding_time"])
     short_trades = execute_short(short_signals_frame, hourly, config)
     long_standalone = replay_long_standalone(long_trades, config)
     short_standalone = replay_short_standalone(short_trades, config)
-    portfolio_trades, account, counts, allocation_audit = replay_portfolio(long_trades, short_trades, hourly, config)
+    portfolio_trades, account, counts, allocation_audit = replay_portfolio(long_trades, short_trades, hourly, config, minutes, funding)
     summary, monthly = summarize(portfolio_trades, account, counts, {"long": long_signals_frame.height, "short": short_signals_frame.height})
-    output = config.root / "results" / "local" / window.id
+    output = output_directory or config.root / "results" / "local" / window.id
     output.mkdir(parents=True, exist_ok=True)
     for name, frame in (
         ("long_trades.parquet", long_trades),
@@ -216,11 +243,15 @@ def _complete_from_signals(
     return summary.to_dicts()[0]
 
 
-def run(config: StrategyConfig, window: Window, offline: bool) -> dict[str, Any]:
-    prepared = prepare(config, window)
+def run(
+    config: StrategyConfig, window: Window, offline: bool, *, cache_directory: Path | None = None,
+    output_directory: Path | None = None,
+) -> dict[str, Any]:
+    prepared = prepare(config, window, cache_directory=cache_directory)
     return _complete_from_signals(
         config, window, prepared.hourly, prepared.features.height,
         prepared.long_signals, prepared.short_signals, prepared.shadow_long_signals, prepared.prior_shadow_history, offline,
+        output_directory=output_directory,
     )
 
 

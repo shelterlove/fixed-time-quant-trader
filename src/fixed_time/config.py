@@ -59,9 +59,11 @@ _SHAPE = {
                             "retrace_quantile": None, "minimum_history": None,
                             "minimum_activated_history": None, "fallback_retrace": None,
                             "break_even_floor": None, "history_source": None},
+             "extension": {"activation_lookback_hours": None, "maximum_extension_hours": None,
+                           "evict_after_hours": None},
              "portfolio": {"total_units": None, "max_positions_per_entry_time": None,
                            "single_signal_units": None, "two_signal_units_each": None,
-                           "same_strategy_open_symbol": None}},
+                           "same_strategy_open_symbol": None, "strict_idle_single_unit_fragment": None}},
     "short": {"entry_hours_utc": None, "r24_rank_min": None, "r24_rank_max": None,
               "r4_rank_change_rank_min": None, "r4_rank_change_rank_max": None,
               "volume_diff_rank_min": None, "volume_diff_rank_max": None, "volume_diff_logic": None,
@@ -74,10 +76,11 @@ _SHAPE = {
                             "max_positions_per_entry_hour": None, "units_per_signal": None,
                             "same_symbol_same_day": None}},
     "portfolio": {"mode": None, "total_units": None, "long_unit_cap": None, "short_unit_cap": None,
-                  "unit_value": None, "long_priority": None, "short_no_funds": None,
-                  "short_eviction_order": None, "short_eviction_price": None,
-                  "same_strategy_open_symbol": None, "cross_strategy_same_symbol": None,
-                  "same_timestamp_order": None},
+                   "unit_value": None, "long_priority": None, "short_no_funds": None,
+                   "short_eviction_order": None, "short_eviction_price": None,
+                   "same_strategy_open_symbol": None, "cross_strategy_same_symbol": None,
+                   "same_timestamp_order": None,
+                   "drawdown_sizing": {"base_multiplier": None, "tiers": None}},
     "windows": {"research": {"start": None, "end_exclusive": None, "subwindows": None},
                 "external_2021": {"start": None, "end_exclusive": None, "protection_history_start": None},
                 "forward_2026_jul_aug": {"start": None, "end_exclusive": None},
@@ -149,6 +152,8 @@ def _validate(values: dict[str, Any]) -> dict[str, Window]:
     _require(0 < protection["activation_return"] and 0 <= protection["retrace_quantile"] <= 1 and protection["window_days"] > 0 and protection["minimum_history"] >= protection["minimum_activated_history"] > 0, "invalid protection parameter")
     _require(long["funding_boundary"] == "entry_exclusive_exit_inclusive" and long["funding_price_proxy"] == "settlement_minute_open", "unsupported long funding semantics")
     _require(protection["method"] == "ROLLING_P90_BREAKEVEN" and protection["break_even_floor"] is True and protection["history_source"] == "all_completed_base_shadow_candidates", "unsupported long protection semantics")
+    _require(long["extension"] == {"activation_lookback_hours": 4, "maximum_extension_hours": 24, "evict_after_hours": 4},
+             "unsupported long extension semantics")
     _require(short["volume_diff_logic"] == "OR" and short["stop_trigger"] == "hourly_high" and short["gap_fill"] == "max_hourly_open_or_stop" and short["funding_model"] == "none_in_v1_reproduction", "unsupported short execution semantics")
     for hour in long["entry_hours_utc"]:
         leg = long["legs"][str(hour)]
@@ -158,18 +163,27 @@ def _validate(values: dict[str, Any]) -> dict[str, Window]:
     for hour in short["entry_hours_utc"]:
         leg = short["legs"][str(hour)]
         _require(leg["hold_hours"] > 0 and (hour + leg["hold_hours"]) % 24 == leg["exit_hour_utc"], f"short leg {hour} hold/exit mismatch")
-    _require(portfolio["total_units"] > 0 and 0 < portfolio["short_unit_cap"] <= portfolio["total_units"] and 0 < portfolio["long_unit_cap"] <= portfolio["total_units"], "invalid portfolio capacity")
-    _require(0 < long["portfolio"]["max_positions_per_entry_time"] <= long["portfolio"]["total_units"], "invalid long entry-slot capacity")
-    _require(0 < long["portfolio"]["two_signal_units_each"] <= long["portfolio"]["single_signal_units"] <= long["portfolio"]["total_units"], "invalid long requested units")
-    _require(0 < short["portfolio"]["max_positions_per_entry_hour"] <= short["portfolio"]["total_daily_units"], "invalid short entry-hour capacity")
-    _require(short["portfolio"]["units_per_signal"] == 1, "short units_per_signal must remain 1")
+    _require(portfolio["total_units"] == portfolio["long_unit_cap"] == portfolio["short_unit_cap"] == 3, "invalid three-unit portfolio capacity")
+    _require(
+        long["portfolio"]["total_units"] == 3
+        and long["portfolio"]["max_positions_per_entry_time"] == 2
+        and long["portfolio"]["single_signal_units"] == 2
+        and long["portfolio"]["two_signal_units_each"] == 1,
+        "invalid long three-unit allocation",
+    )
+    _require(
+        short["portfolio"]["total_daily_units"] == 3
+        and short["portfolio"]["max_positions_per_entry_hour"] == 2
+        and short["portfolio"]["units_per_signal"] == 1,
+        "invalid short three-unit allocation or units_per_signal",
+    )
     _require(long["portfolio"]["total_units"] == portfolio["total_units"] == portfolio["long_unit_cap"], "long/combined unit capacities disagree")
     _require(short["portfolio"]["total_daily_units"] == portfolio["short_unit_cap"], "short/combined unit capacities disagree")
     _require(short["portfolio"]["selection"] == "SEQUENTIAL_06_THEN_08" and short["portfolio"]["same_symbol_same_day"] == "allow_in_standalone", "unsupported short portfolio semantics")
     _require(long["portfolio"]["same_strategy_open_symbol"] == "skip", "unsupported long duplicate semantics")
     _require(
         portfolio["mode"] == "LONG_PRIORITY_SKIP"
-        and portfolio["unit_value"] == "free_cash_divided_by_free_units"
+        and portfolio["unit_value"] == "pre_entry_equity_divided_by_total_units"
         and portfolio["long_priority"] is True
         and portfolio["short_no_funds"] == "skip"
         and portfolio["short_eviction_order"] == "worst_priority_then_signal_time_then_symbol"
@@ -178,6 +192,17 @@ def _validate(values: dict[str, Any]) -> dict[str, Window]:
         and portfolio["cross_strategy_same_symbol"] == "allow"
         and portfolio["same_timestamp_order"] == "exits_evictions_long_short",
         "unsupported combined portfolio semantics",
+    )
+    sizing = portfolio["drawdown_sizing"]
+    _require(
+        long["portfolio"]["strict_idle_single_unit_fragment"] is True
+        and sizing["base_multiplier"] == 1.0
+        and sizing["tiers"] == [
+            {"threshold": 0.25, "multiplier": 1.05}, {"threshold": 0.30, "multiplier": 1.10},
+            {"threshold": 0.35, "multiplier": 1.15}, {"threshold": 0.40, "multiplier": 1.20},
+            {"threshold": 0.45, "multiplier": 1.25}, {"threshold": 0.50, "multiplier": 1.30},
+        ],
+        "unsupported drawdown sizing semantics",
     )
     windows: dict[str, Window] = {}
     for name, raw in values["windows"].items():

@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 import polars as pl
 import pytest
 
-from fixed_time.execution import execute_long, execute_short
+from fixed_time.execution import execute_long, execute_short, extend_long_trades, extension_requirements
 from fixed_time.storage import DataError
 from fixed_time.config import load_config
 
@@ -38,6 +38,35 @@ def test_long_funding_uses_original_event_boundary_and_settlement_minute_open() 
     funding = pl.DataFrame([{"symbol": "A", "funding_time": start + timedelta(minutes=2, milliseconds=28), "funding_rate": 0.0001}])
     trade = execute_long(_long_signal(), minutes, funding, CONFIG).to_dicts()[0]
     assert trade["funding_return"] == pytest.approx(-0.0001 * 120 / (100 * 1.001))
+
+
+@pytest.mark.parametrize("at_cap", [False, True])
+def test_selected_long_extension_is_part_of_the_product_execution_path(at_cap) -> None:
+    start = datetime(2022, 1, 1, 14, tzinfo=UTC)
+    signal = _long_signal().with_columns(pl.col("planned_exit_time") + pl.duration(minutes=1))
+    values = [(100., 100., 100., 100.), (100., 100., 100., 100.),
+              (100., 100., 100., 100.), (100., 130., 100., 120.)]
+    rows = [{"symbol": "A", "open_time": start+timedelta(minutes=index), "open": item[0], "high": item[1],
+             "low": item[2], "close": item[3], "quote_volume": 1., "trade_count": 1}
+            for index, item in enumerate(values)]
+    deadline = signal.item(0, "planned_exit_time") + timedelta(hours=24)
+    current = start + timedelta(minutes=4)
+    while current < deadline:
+        trigger_minute = deadline - timedelta(minutes=1) if at_cap else start + timedelta(minutes=4)
+        low = 99. if current == trigger_minute else 110.
+        rows.append({"symbol": "A", "open_time": current, "open": 120., "high": 120., "low": low,
+                     "close": 110., "quote_volume": 1., "trade_count": 1})
+        current += timedelta(minutes=1)
+    funding = pl.DataFrame(schema={"symbol": pl.String, "funding_time": pl.Datetime("us", "UTC"), "funding_rate": pl.Float64})
+    base = execute_long(signal, pl.DataFrame(rows[:4]), funding, CONFIG)
+    assert base.item(0, "protection_activated_at") == start + timedelta(minutes=4)
+    minute_days, _ = extension_requirements(base, CONFIG)
+    assert minute_days
+    extended, _ = extend_long_trades(base, pl.DataFrame(rows), funding, CONFIG)
+    trade = extended.to_dicts()[0]
+    assert trade["extension_applied"] is True
+    assert trade["exit_time"] == (deadline if at_cap else start + timedelta(minutes=5))
+    assert trade["exit_reason"] == "PROTECTION"
 
 
 def test_long_entry_reference_uses_completed_entry_minute_close_not_visible_hourly_close() -> None:
@@ -78,8 +107,8 @@ def test_short_hard_stop_excursions_exclude_post_exit_hours() -> None:
     ])
     trade = execute_short(signal, hourly, CONFIG).to_dicts()[0]
     assert trade["exit_time"] == entry + timedelta(hours=1)
-    assert trade["mae_return"] == pytest.approx(100 / 140 - 1)
-    assert trade["mfe_return"] == pytest.approx(100 / 95 - 1)
+    assert trade["mae_return"] == pytest.approx(-.4)
+    assert trade["mfe_return"] == pytest.approx(.05)
 
 
 def test_long_p90_protection_uses_completed_shadow_history_only() -> None:
@@ -138,7 +167,7 @@ def test_missing_minute_path_fails_without_mutating_candidates() -> None:
     assert signal.height == 1
 
 
-def test_long_terminal_path_forces_exit_at_last_completed_minute_close() -> None:
+def test_long_missing_terminal_path_is_not_a_fill() -> None:
     signal = _long_signal().with_columns(pl.col("planned_exit_time") + pl.duration(minutes=2))
     start = datetime(2022, 1, 1, 14, tzinfo=UTC)
     minutes = pl.DataFrame([
@@ -147,8 +176,8 @@ def test_long_terminal_path_forces_exit_at_last_completed_minute_close() -> None
         {"symbol": "A", "open_time": start + timedelta(minutes=2), "open": 104., "high": 106., "low": 103., "close": 105., "quote_volume": 1., "trade_count": 1},
     ])
     funding = pl.DataFrame(schema={"symbol": pl.String, "funding_time": pl.Datetime("us", "UTC"), "funding_rate": pl.Float64})
-    trade = execute_long(signal, minutes, funding, CONFIG).to_dicts()[0]
-    assert (trade["exit_time"], trade["exit_reference"], trade["exit_reason"]) == (start + timedelta(minutes=3), 105., "DATA_PATH_FORCED_EXIT")
+    with pytest.raises(DataError, match="incomplete terminal path"):
+        execute_long(signal, minutes, funding, CONFIG)
 
 
 def test_internal_minute_gap_remains_an_error() -> None:
@@ -164,7 +193,7 @@ def test_internal_minute_gap_remains_an_error() -> None:
         execute_long(signal, minutes, funding, CONFIG)
 
 
-def test_short_terminal_path_forces_exit_at_last_completed_hour_close() -> None:
+def test_short_missing_terminal_path_is_not_a_fill() -> None:
     entry = datetime(2022, 1, 1, 6, tzinfo=UTC)
     signal = pl.DataFrame([{ "trade_id": "short:A", "symbol": "A", "decision_time": entry, "entry_time": entry,
         "planned_exit_time": entry + timedelta(hours=3), "priority_score": 1 }])
@@ -173,5 +202,5 @@ def test_short_terminal_path_forces_exit_at_last_completed_hour_close() -> None:
         {"symbol": "A", "open_time": entry, "open": 100., "high": 100., "low": 90., "close": 95., "quote_volume": 1., "trade_count": 1},
         {"symbol": "A", "open_time": entry + timedelta(hours=1), "open": 95., "high": 96., "low": 80., "close": 85., "quote_volume": 1., "trade_count": 1},
     ])
-    trade = execute_short(signal, hourly, CONFIG).to_dicts()[0]
-    assert (trade["exit_time"], trade["exit_reference"], trade["exit_reason"]) == (entry + timedelta(hours=2), 85., "DATA_PATH_FORCED_EXIT")
+    with pytest.raises(DataError, match="incomplete terminal path"):
+        execute_short(signal, hourly, CONFIG)
