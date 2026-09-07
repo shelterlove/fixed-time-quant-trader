@@ -11,7 +11,7 @@ CONFIG = load_config()
 
 def _trade(strategy: str, symbol: str, entry, exit, units: int, score: int, order: int | None = None) -> dict:
     return {"trade_id": f"{strategy}:{symbol}", "strategy": strategy, "symbol": symbol, "signal_time": entry,
-            "entry_time": entry, "planned_exit_time": exit, "exit_time": exit, "entry_reference": 100., "exit_reference": 100.,
+            "entry_time": entry, "planned_exit_time": exit, "exit_time": exit, "entry_reference": 100., "entry_fill": 100., "entry_cost_return": 0., "exit_reference": 100.,
             "exit_reason": "PLANNED_EXIT", "units": units, "notional": 1., "gross_return": 0., "cost_return": 0.,
             "funding_return": 0., "net_return": 0., "pnl": 0., "mae_return": 0., "mfe_return": 0.,
             "priority_score": score, "priority_order": order if order is not None else score,

@@ -30,7 +30,8 @@ svg{width:100%;height:220px;display:block}.chart-tools{float:right}button{backgr
 <div class="grid two"><section class="card"><h2>账户净值与回撤 <span class="chart-tools"><button data-n="1440" class="on">1天</button><button data-n="10080">7天</button><button data-n="43200">30天</button><button data-n="0">全部</button></span></h2><svg id="chart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg><div id="chart-note" class="muted"></div></section>
 <section class="card"><h2>交易状态</h2><div id="blocks"></div></section></div>
 <section class="card section"><h2>当前持仓</h2><div class="scroll"><table><thead><tr><th>方向 / 标的</th><th>单位</th><th>数量</th><th>入场 / 估值</th><th>浮盈亏</th><th>止损保护</th><th>计划退出</th><th>开仓倍率</th></tr></thead><tbody id="positions"></tbody></table></div></section>
-<section class="card section"><h2>历史交易</h2><div class="scroll"><table><thead><tr><th>开仓时间</th><th>方向 / 标的</th><th>数量</th><th>成交名义</th><th>实现盈亏</th><th>手续费</th><th>净收益</th><th>状态 / 原因</th></tr></thead><tbody id="trades"></tbody></table></div><div id="trade-note" class="muted"></div></section>
+<section class="card section"><h2>历史交易</h2><div class="scroll"><table><thead><tr><th>开仓时间</th><th>方向 / 标的</th><th>数量</th><th>成交名义</th><th>实现盈亏</th><th>手续费</th><th>净收益（不含资金费）</th><th>状态 / 原因</th></tr></thead><tbody id="trades"></tbody></table></div><div id="trade-note" class="muted"></div></section>
+<section class="card section"><h2>最近订单时间</h2><div id="timings"></div></section>
 <div class="grid two section"><section class="card"><h2>最近决策</h2><div id="decisions"></div></section><section class="card"><h2>运行事件</h2><div id="events"></div></section></div>
 </div><script>
 const $=id=>document.getElementById(id), esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -39,12 +40,13 @@ const money=x=>x==null?'—':num(x,2)+' USDT', dt=x=>x?new Date(x).toLocaleStrin
 function decisionReason(d){const c=d.detail?.candidates||[],a=d.detail?.admissions||[];if(!c.length)return '该时点没有策略信号';if(!a.length)return c.some(v=>!v.testnet_eligible)?'候选不支持测试网交易':'候选未获容量准入或执行被跳过';return a.map(v=>`${v.symbol} ${v.units}单位 ${v.outcome||''}`).join('；')}
 function render(x){const r=x.runtime||{},p=x.performance||{},alive=r.heartbeat_at&&Date.now()-Date.parse(r.heartbeat_at)<30000,ready=alive&&!r.last_error&&r.reconciled_at&&!x.active_blocks.length;
 $('status').innerHTML=`<span class="pill ${alive?'good':'bad'}">进程${alive?'在线':'离线'}</span><span class="pill ${ready?'good':'warn'}">${ready?'允许新仓':'暂停新仓'}</span><br><span class="muted">心跳 ${dt(r.heartbeat_at)} · 版本 ${esc(r.version)}</span>`;
-const cards=[['账户净值',money(p.equity)],['累计净收益',p.total_net_pnl==null?'统计中':pnl(p.total_net_pnl)],['今日净收益',p.today_net_pnl==null?'统计中':pnl(p.today_net_pnl)],['持仓浮盈亏',p.unrealized_pnl==null?'—':pnl(p.unrealized_pnl)],['当前回撤 / 新仓倍率',p.drawdown==null?'—':num(100*p.drawdown,2)+'% · '+num(p.exposure_multiplier,2)+'x'],['逻辑仓位',`${r.open_units??0} / 3 单位`]];
+const cards=[['账户净值',money(p.equity)],['累计净收益',p.total_net_pnl==null?'统计中':pnl(p.total_net_pnl)+`<div class="muted label">其中资金费 ${money(p.funding_pnl)}</div>`],['今日净收益',p.today_net_pnl==null?'统计中':pnl(p.today_net_pnl)],['持仓浮盈亏',p.unrealized_pnl==null?'—':pnl(p.unrealized_pnl)],['当前回撤 / 新仓倍率',p.drawdown==null?'—':num(100*p.drawdown,2)+'% · '+num(p.exposure_multiplier,2)+'x'],['逻辑仓位',`${r.open_units??0} / 3 单位`]];
 $('kpis').innerHTML=cards.map(c=>`<section class="card"><div class="label">${c[0]}</div><div class="value">${c[1]}</div></section>`).join('');
 $('blocks').innerHTML=x.active_blocks.length?x.active_blocks.map(b=>`<div class="event bad"><b>${esc(b.code)}</b> · ${esc(b.detail)}<small>首次 ${dt(b.first_seen)} · 最近 ${dt(b.last_seen)} · ${b.occurrences} 次</small></div>`).join(''):`<div class="empty ${ready?'good':'warn'}">${ready?'对账正常，等待策略信号':esc(r.last_error||'等待进程和对账状态恢复')}</div>`;
 $('positions').innerHTML=x.positions.length?x.positions.map(v=>`<tr><td>${v.position_side==='LONG'?'多':'空'} · ${esc(v.symbol)}${v.extension_active?' <span class="pill">延长</span>':''}</td><td>${v.units}</td><td>${esc(v.quantity)}</td><td>${num(v.entry_price)} / ${num(v.last_mark_price)}</td><td>${pnl(v.unrealized_pnl)}</td><td>${v.stop_algo_id?'<span class="good">硬止损已确认</span>':'<span class="bad">硬止损待确认</span>'}<br><span class="muted">${esc(v.target_stop||v.active_trigger_price)}</span></td><td>${dt(v.scheduled_exit_time)}</td><td>${num(v.exposure_multiplier,2)}x<br><span class="muted">DD ${num(100*Number(v.pre_entry_drawdown||0),2)}%</span></td></tr>`).join(''):`<tr><td colspan="8" class="empty">当前空仓；请在最近决策中查看无交易原因</td></tr>`;
-$('trades').innerHTML=x.trades.length?x.trades.map(t=>`<tr><td>${dt(t.opened_at)}</td><td>${t.position_side==='LONG'?'多':'空'} · ${esc(t.symbol)}</td><td>${esc(t.entry_quantity||t.quantity)}</td><td>${money(t.filled_notional)}</td><td>${t.fills_complete?pnl(t.realized_pnl):'待同步'}</td><td>${!t.fills_complete?'待同步':t.non_usdt_fee_count?'待换算':money(t.commission)}</td><td>${!t.fills_complete?'待同步':t.non_usdt_fee_count?'待换算':pnl(t.net_pnl)}</td><td>${esc(t.status)}<br><span class="muted">${esc(t.exit_reason)}</span></td></tr>`).join(''):`<tr><td colspan="8" class="empty">尚无本地交易记录</td></tr>`;
+$('trades').innerHTML=x.trades.length?x.trades.map(t=>`<tr><td>${dt(t.opened_at)}</td><td>${t.position_side==='LONG'?'多':'空'} · ${esc(t.symbol)}<br><small class="muted">${t.code_version?esc(t.code_version)+' · '+esc(t.portfolio_units)+'仓':'历史版本未记录'}</small></td><td>${esc(t.entry_quantity||t.quantity)}</td><td>${money(t.filled_notional)}</td><td>${t.fills_complete?pnl(t.realized_pnl):'待同步'}</td><td>${!t.fills_complete?'待同步':t.non_usdt_fee_count?'待换算':money(t.commission)}</td><td>${!t.fills_complete?'待同步':t.non_usdt_fee_count?'待换算':pnl(t.net_pnl)}</td><td>${esc(t.status)}${t.exit_reason&&t.exit_reason!==t.status?'<br><span class="muted">'+esc(t.exit_reason)+'</span>':''}</td></tr>`).join(''):`<tr><td colspan="8" class="empty">尚无本地交易记录</td></tr>`;
 $('trade-note').textContent=p.accounting_note||'';
+$('timings').innerHTML=(x.execution_timing||[]).slice(0,6).map(t=>`<div class="event">${esc(t.symbol)} · ${t.role==='EXIT'?'平仓':'开仓'}<small>计划 ${dt(t.planned_at)} · 开始 ${dt(t.started_at)} · 提交 ${dt(t.submitted_at)} · 成交 ${dt(t.exchange_at)} · 收到响应 ${dt(t.response_at)}</small></div>`).join('')||'<div class="empty">尚无订单时间记录</div>';
 $('decisions').innerHTML=x.decisions.length?x.decisions.map(d=>`<div class="event"><b>${dt(d.decision_time)}</b> · ${d.status} · 候选 ${d.candidate_count??0} · 成交准入 ${d.admission_count??0}<small>${esc(d.error||decisionReason(d))}</small></div>`).join(''):`<div class="empty">尚无决策记录</div>`;
 $('events').innerHTML=x.events.length?x.events.map(e=>`<div class="event ${e.status==='BLOCKED'?'bad':''}">${esc(e.status)} · ${esc(e.detail)}<small>${dt(e.checked_at)}</small></div>`).join(''):`<div class="empty">尚无运行事件</div>`;if(chartRange===1440)draw(x.equity||[])}
 function draw(rows){const svg=$('chart');if(rows.length<2){svg.innerHTML='';$('chart-note').textContent=rows.length?'等待更多分钟净值':'尚无完整分钟净值';return}const W=900,H=220,pad=14,ys=rows.map(r=>Number(r.equity)),lo=Math.min(...ys),hi=Math.max(...ys),span=hi-lo||1,pts=ys.map((y,i)=>`${pad+i*(W-2*pad)/(ys.length-1)},${pad+(hi-y)*(H-2*pad)/span}`).join(' ');svg.innerHTML=`<line x1="0" y1="205" x2="900" y2="205" stroke="#253247"/><polyline points="${pts}" fill="none" stroke="#55a7ff" stroke-width="2" vector-effect="non-scaling-stroke"/>`;$('chart-note').textContent=`${dt(rows[0].minute_end)} 至 ${dt(rows.at(-1).minute_end)} · 区间 ${num(lo)} — ${num(hi)} USDT`}
@@ -120,6 +122,9 @@ def read_status(database_path: Path) -> dict[str, Any]:
         transfer = external_flows(first["minute_end"]) if first else Decimal("0")
         today_transfer = external_flows(today_first["minute_end"]) if today_first else Decimal("0")
         performance: dict[str, Any] = {
+            "funding_pnl": format(sum((Decimal(row[0]) for row in connection.execute(
+                "SELECT income FROM income_events WHERE asset='USDT' AND income_type='FUNDING_FEE' AND occurred_at > ? AND occurred_at <= ?",
+                (first["minute_end"], latest["minute_end"]))), Decimal("0")), "f") if first and latest else None,
             "equity": latest["equity"] if latest else None, "unrealized_pnl": latest["unrealized_pnl"] if latest else None,
             "drawdown": latest["drawdown"] if latest else None, "exposure_multiplier": latest["exposure_multiplier"] if latest else None,
             "total_net_pnl": format(Decimal(latest["equity"])-Decimal(first["equity"])-Decimal(str(transfer)), "f") if latest and first else None,
@@ -138,6 +143,7 @@ def read_status(database_path: Path) -> dict[str, Any]:
             FROM positions JOIN intents USING(intent_id) WHERE positions.status='OPEN' ORDER BY opened_at""")
         trades = _rows(connection, """SELECT positions.intent_id,positions.symbol,positions.position_side,positions.units,
                 positions.quantity,positions.filled_notional,positions.status,positions.opened_at,
+                (SELECT run_id FROM intents WHERE intent_id=positions.intent_id) AS run_id,
                 (SELECT quantity FROM executions e WHERE e.intent_id=positions.intent_id AND e.role='ENTRY' LIMIT 1) AS entry_quantity,
                 (SELECT reason FROM executions e WHERE e.intent_id=positions.intent_id AND e.role='EXIT' ORDER BY recorded_at DESC LIMIT 1) AS exit_reason,
                 COUNT(tf.trade_id) AS fill_count,
@@ -151,11 +157,18 @@ def read_status(database_path: Path) -> dict[str, Any]:
             LEFT JOIN trade_fills tf USING(intent_id) GROUP BY positions.intent_id
             ORDER BY positions.opened_at DESC LIMIT 50""")
         for trade in trades:
+            deployment = connection.execute("SELECT snapshot_json FROM deployment_runs WHERE run_id = ?", (trade["run_id"],)).fetchone()
+            snapshot = json.loads(deployment[0]) if deployment else {}
+            trade.update(code_version=snapshot.get("code_version"), revision=snapshot.get("revision"),
+                         portfolio_units=snapshot.get("strategy", {}).get("portfolio", {}).get("total_units"))
             trade["fills_complete"] = bool(trade["fill_count"] and trade["executed_quantity"] is not None
                 and isclose(trade["synced_quantity"], trade["executed_quantity"], rel_tol=1e-9, abs_tol=0.0))
             if not trade["fills_complete"]:
                 trade.update(realized_pnl=None, commission=None, net_pnl=None)
+        timings = _rows(connection, """SELECT t.*, i.symbol FROM execution_timing t JOIN intents i USING(intent_id)
+            ORDER BY COALESCE(t.submitted_at,t.response_at) DESC LIMIT 20""")
         return {"generated_at": datetime.now(UTC).isoformat(), "runtime": dict(runtime) if runtime else None,
+                "execution_timing": timings,
                 "performance": performance, "active_blocks": _rows(connection, "SELECT * FROM entry_blocks WHERE resolved_at IS NULL ORDER BY first_seen"),
                 "positions": positions, "trades": trades, "decisions": decisions,
                 "events": _rows(connection, "SELECT * FROM reconciliation ORDER BY checked_at DESC LIMIT 20"),

@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_CEILING
 import json
 import signal
 from threading import Event
+from uuid import uuid4
 from typing import Any
 
 import polars as pl
@@ -16,6 +17,7 @@ from .config import LiveConfig
 from .state import EXECUTION_VERSION, StateError, StateStore, _exchange_time
 from .strategy import Admission, allowed_retrace, protection_sample, decision_candidates, entry_notional, exposure_multiplier, long_protection_update, plan_admissions
 from .shadows import advance_shadow, shadow_start
+from .provenance import deployment_snapshot
 
 
 class LiveEngine:
@@ -25,6 +27,8 @@ class LiveEngine:
         self.store = store or StateStore(config.database_path)
         self._stop_requested = Event()
         self._started_at = self._iso(self._now())
+        self.run_id = uuid4().hex
+        self.store.record_deployment(self.run_id, self._started_at, deployment_snapshot(config))
         self._workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="market-read")
         self._decision_job: tuple[datetime, Future] | None = None
         self._shadow_job: Future | None = None
@@ -362,12 +366,14 @@ class LiveEngine:
                     self.store.finish_exit_attempt(attempt["client_order_id"], "NO_FILL")
                     return
                 raise
+        self.store.record_timing(attempt["client_order_id"], position["intent_id"], "EXIT", response_at=self._iso(self._now()))
         response = self._terminal_order(position["symbol"], attempt["client_order_id"], response)
         if Decimal(str(response.get("executedQty", "0"))) > 0:
             response = self._with_average_price(position["symbol"], attempt["client_order_id"], response)
         self.store.apply_exit(attempt, response)
 
     def _close(self, position: dict[str, Any], reason: str) -> None:
+        started_at = self._iso(self._now())
         self.store.require_exit(position["intent_id"], reason)
         current = next((row for row in self.store.open_positions() if row["intent_id"] == position["intent_id"]), None)
         if current is None:
@@ -385,6 +391,10 @@ class LiveEngine:
             sequence = self.store.next_exit_sequence(position["intent_id"])
             requested = min(requested, self.client.symbol_filters(position["symbol"]).get("max_qty", requested))
             attempt = self.store.begin_exit_attempt(position["intent_id"], format(requested, "f"), reason, self._exit_client_id(position, sequence), sequence=sequence)
+            self.store.record_timing(attempt["client_order_id"], position["intent_id"], "EXIT",
+                planned_at=(position.get("scheduled_exit_time") or position["planned_exit_time"])
+                    if reason in {"PLANNED_EXIT", "EXTENSION_CAP"} else None,
+                started_at=started_at, submitted_at=self._iso(self._now()))
             try:
                 response = self.client.market_order(position["symbol"], self._side(position["strategy"], False), position["position_side"], requested, attempt["client_order_id"])
             except BinanceError as exc:
@@ -547,7 +557,32 @@ class LiveEngine:
             "sizing_version": "drawdown-2x-v2",
         }
 
-    def _prepare_open(self, admission: Admission, *, deadline: datetime | None = None) -> dict[str, Any] | None:
+    def _release_estimate(self, victim_ids: tuple[str, ...]) -> Decimal:
+        """Estimate net isolated collateral released by the exact remaining victims.
+
+        positionRisk provides isolatedWallet and unRealizedProfit. This is a
+        preflight estimate only; actual available balance is checked after exits.
+        """
+        victims = [p for p in self.store.open_positions() if p["intent_id"] in victim_ids]
+        if not victims:
+            return Decimal("0")
+        exchange = {(p["symbol"], p["positionSide"]): p for p in self.client.positions()}
+        released = Decimal("0")
+        for victim in victims:
+            observed = exchange.get((victim["symbol"], victim["position_side"]), {})
+            if not {"isolatedWallet", "unRealizedProfit", "markPrice", "positionAmt"} <= observed.keys():
+                raise StateError(f"cannot estimate released margin for {victim['symbol']}")
+            quantity = abs(Decimal(str(observed["positionAmt"])))
+            if quantity != Decimal(victim["quantity"]):
+                raise StateError("cannot estimate margin with unresolved position quantities")
+            cushion = quantity * Decimal(str(observed["markPrice"])) * Decimal("0.003")
+            released += max(Decimal("0"), Decimal(str(observed["isolatedWallet"]))
+                            + Decimal(str(observed["unRealizedProfit"])) - cushion)
+        return released
+
+    def _prepare_open(self, admission: Admission, *, deadline: datetime | None = None,
+                      allow_release: bool = False) -> dict[str, Any] | None:
+        started_at = self._iso(self._now())
         row = admission.candidate
         symbol, strategy, position_side = str(row["symbol"]), str(row["strategy"]), str(row["position_side"])
         existing = self.store.intent(str(row["trade_id"]))
@@ -573,6 +608,12 @@ class LiveEngine:
         if notional <= 0:
             return None
         available = self.client.balance()
+        if allow_release and admission.evict_intent_ids:
+            try:
+                available += self._release_estimate(admission.evict_intent_ids)
+            except StateError as exc:
+                self.store.record_reconciliation("ENTRY_SKIPPED", str(exc))
+                return None
         leverage = Decimal(str(self.config.leverage))
         if available <= 0 or notional * (Decimal("1") + reserve) / leverage > available:
             self.store.record_reconciliation("ENTRY_SKIPPED", f"{symbol}: insufficient available margin for fixed target notional")
@@ -589,7 +630,7 @@ class LiveEngine:
             sample = protection_sample(self.store.shadow_history(), decision, self.config.strategy)
         if deadline is not None and self._now() >= deadline:
             return None
-        return {"sizing": sizing, "filters": filters, "quantity": quantity, "sample": sample,
+        return {"sizing": sizing, "filters": filters, "quantity": quantity, "sample": sample, "started_at": started_at,
                 "symbol": symbol, "strategy": strategy, "position_side": position_side,
                 "intent_id": intent_id, "client_order_id": client_order_id, "decision": decision}
 
@@ -617,7 +658,9 @@ class LiveEngine:
             "intent_id": intent_id, "strategy": strategy, "symbol": symbol, "position_side": position_side,
             "decision_time": self._iso(decision), "planned_exit_time": self._iso(row["planned_exit_time"]),
             "units": admission.units, "priority_score": float(row["priority_score"]), "client_order_id": client_order_id,
-        }, protection=sample, execution_version=EXECUTION_VERSION, sizing=sizing)
+        }, protection=sample, execution_version=EXECUTION_VERSION, sizing=sizing, run_id=row.get("run_id", self.run_id))
+        self.store.record_timing(client_order_id, intent_id, "ENTRY", planned_at=self._iso(decision),
+                                 started_at=prepared.get("started_at", self._iso(self._now())), submitted_at=self._iso(self._now()))
         try:
             response = self.client.market_order(symbol, self._side(strategy, True), position_side, quantity, client_order_id)
         except BinanceError as exc:
@@ -629,6 +672,7 @@ class LiveEngine:
                 response = self.client.query_order(symbol, client_order_id)
             except BinanceError:
                 raise exc
+        self.store.record_timing(client_order_id, intent_id, "ENTRY", response_at=self._iso(self._now()))
         response = self._terminal_order(symbol, client_order_id, response)
         filled = Decimal(str(response.get("executedQty", "0")))
         if filled <= 0:
@@ -709,6 +753,7 @@ class LiveEngine:
                 admissions = plan_admissions([row for row in candidates if row["testnet_eligible"]], self.store.open_positions(), self.config.strategy)
                 for item in admissions:
                     item.candidate["sizing"] = sizing
+                    item.candidate["run_id"] = self.run_id
                 if any(item.candidate["strategy"] == "long" for item in admissions):
                     sample = protection_sample(self.store.shadow_history(), decision_time, self.config.strategy)
                     for item in admissions:
@@ -723,15 +768,28 @@ class LiveEngine:
                 # of two one-unit entries into a new two-unit single entry.
                 if self._now() >= decision_time + timedelta(seconds=self.config.decision_deadline_seconds):
                     break
-                prepared = self._prepare_open(admission, deadline=decision_time + timedelta(seconds=self.config.decision_deadline_seconds))
+                deadline = decision_time + timedelta(seconds=self.config.decision_deadline_seconds)
+                prepared = self._prepare_open(admission, deadline=deadline, allow_release=True)
                 if prepared is None:
                     admission.candidate["execution_outcome"] = "SKIPPED"
                     continue
                 for victim_id in (() if "existing" in prepared else admission.evict_intent_ids):
+                    if self._now() >= deadline:
+                        break
                     victim = next((row for row in self.store.open_positions() if row["intent_id"] == victim_id), None)
                     if victim is not None:
                         reason = "LONG_EXTENSION_EVICTION" if victim["strategy"] == "long" and bool(victim.get("extension_active")) else "LONG_PRIORITY_EVICTION"
                         self._close(victim, reason)
+                if admission.evict_intent_ids and "existing" not in prepared:
+                    # Preserve the frozen batch basis, but refresh balance,
+                    # filters and price after confirmed exits (also on restart).
+                    admission.candidate["sizing"] = prepared["sizing"]
+                    admission.candidate["protection_sample"] = prepared["sample"]
+                    prepared = self._prepare_open(admission, deadline=deadline)
+                    if prepared is None:
+                        admission.candidate["execution_outcome"] = "SKIPPED_AFTER_EVICTION"
+                        self.store.record_reconciliation("SKIPPED_AFTER_EVICTION", str(admission.candidate["trade_id"]))
+                        continue
                 outcome = self._open(admission, deadline=decision_time + timedelta(seconds=self.config.decision_deadline_seconds), prepared=prepared)
                 admission.candidate["execution_outcome"] = outcome
                 if outcome == "OPEN":
@@ -739,10 +797,12 @@ class LiveEngine:
             self.store.mark_decision_done(decision_key)
             self.store.finish_decision(decision_key, len(symbols) or len({row["symbol"] for row in candidates}), candidates,
                 [{"symbol": item.candidate["symbol"], "strategy": item.candidate["strategy"], "units": item.units,
-                  "evicted": list(item.evict_intent_ids), "outcome": item.candidate.get("execution_outcome")} for item in completed])
+                  "evicted": list(item.evict_intent_ids), "outcome": item.candidate.get("execution_outcome", "DEADLINE_EXCEEDED")} for item in admissions])
             return completed
         except Exception as exc:
-            self.store.finish_decision(decision_key, len(symbols), candidates, [], error=str(exc))
+            self.store.finish_decision(decision_key, len(symbols), candidates,
+                [{"symbol": item.candidate["symbol"], "units": item.units, "evicted": list(item.evict_intent_ids),
+                  "outcome": item.candidate.get("execution_outcome", "UNRESOLVED")} for item in admissions], error=str(exc))
             raise
 
     @staticmethod

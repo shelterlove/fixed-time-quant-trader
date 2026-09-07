@@ -1,5 +1,10 @@
 #!/usr/bin/env sh
 set -eu
+SOURCE_REVISION=$(git rev-parse HEAD)
+if [ -n "$(git status --porcelain)" ]; then
+  SOURCE_REVISION="${SOURCE_REVISION}-dirty"
+fi
+export SOURCE_REVISION
 
 if [ ! -f .env ]; then
   echo "missing .env" >&2

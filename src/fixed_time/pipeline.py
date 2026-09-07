@@ -193,7 +193,7 @@ def _complete_from_signals(
         long_execution_signals, minutes, funding, config, prior_shadow_history,
         window.start if not shadow_long_signals.is_empty() else None,
     )
-    extension_days, extension_months = extension_requirements(long_trades, config)
+    extension_days, extension_months = extension_requirements(long_trades, config, window)
     if extension_days:
         extra_days, extra_months = extension_days - minute_days, extension_months - funding_months
         if not offline:
@@ -205,7 +205,10 @@ def _complete_from_signals(
             minutes = pl.concat([minutes, load_minutes(config.root, extra_days)], how="vertical_relaxed").sort(["symbol", "open_time"])
         if extra_months:
             funding = pl.concat([funding, load_funding(config.root, extra_months)], how="vertical_relaxed").sort(["symbol", "funding_time"])
-        long_trades, extension_funding = extend_long_trades(long_trades, minutes, funding, config)
+    if not long_trades.is_empty():
+        minutes = minutes.filter(pl.col("open_time") < pl.lit(window.end_exclusive))
+        funding = funding.filter(pl.col("funding_time") <= pl.lit(window.end_exclusive))
+        long_trades, extension_funding = extend_long_trades(long_trades, minutes, funding, config, window)
         extended_ids = long_trades.filter(pl.col("extension_applied")).get_column("trade_id")
         funding_event_detail = funding_event_detail.filter(~pl.col("trade_id").is_in(extended_ids))
         if not extension_funding.is_empty():
@@ -232,6 +235,7 @@ def _complete_from_signals(
         atomic_write_frame(output / name, frame)
     atomic_write_text(output / "REPORT.md", report_markdown(summary, portfolio_trades))
     manifest = {"strategy_version": config.version, "window": window.id, "parameters": config.values,
+                "accounting_version": "cash-events-v1", "boundary_policy": "extension_window_end",
                 "hourly_rows": hourly.height, "feature_rows": feature_rows,
                 "long_signal_rows": long_signals_frame.height, "short_signal_rows": short_signals_frame.height,
                 "shadow_long_signal_rows": shadow_long_signals.height,

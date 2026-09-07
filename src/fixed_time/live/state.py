@@ -135,6 +135,13 @@ class StateStore:
     def _migrate(self) -> None:
         with self.transaction() as connection:
             connection.executescript("""
+                CREATE TABLE IF NOT EXISTS deployment_runs (
+                    run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, snapshot_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS execution_timing (
+                    client_order_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, role TEXT NOT NULL,
+                    planned_at TEXT, started_at TEXT, submitted_at TEXT, response_at TEXT, exchange_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS intents (
                     intent_id TEXT PRIMARY KEY,
                     strategy TEXT NOT NULL,
@@ -346,6 +353,7 @@ class StateStore:
             intent_columns = {row[1] for row in connection.execute("PRAGMA table_info(intents)")}
             for name, declaration in (
                 ("protection_json", "TEXT"), ("execution_version", "TEXT NOT NULL DEFAULT 'minute-v1'"),
+                ("run_id", "TEXT"),
                 ("base_unit_capital", "TEXT"), ("pre_entry_equity", "TEXT"), ("pre_entry_peak", "TEXT"),
                 ("pre_entry_drawdown", "TEXT"), ("exposure_multiplier", "TEXT"), ("target_notional", "TEXT"),
                 ("sizing_version", "TEXT NOT NULL DEFAULT 'legacy-1x'"),
@@ -433,8 +441,25 @@ class StateStore:
                                   ("income_time", "income_events(occurred_at)")):
                 connection.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {target}")
 
+    def record_deployment(self, run_id: str, started_at: str, snapshot: dict) -> None:
+        with self.transaction() as connection:
+            connection.execute("INSERT INTO deployment_runs VALUES (?, ?, ?)",
+                               (run_id, started_at, json.dumps(snapshot, default=str)))
+
+    def record_timing(self, client_order_id: str, intent_id: str, role: str, **times: str | None) -> None:
+        allowed = {"planned_at", "started_at", "submitted_at", "response_at", "exchange_at"}
+        if not times.keys() <= allowed:
+            raise StateError("invalid execution timing field")
+        with self.transaction() as connection:
+            connection.execute("INSERT OR IGNORE INTO execution_timing (client_order_id, intent_id, role) VALUES (?, ?, ?)",
+                               (client_order_id, intent_id, role))
+            for field, value in times.items():
+                connection.execute(f"UPDATE execution_timing SET {field} = COALESCE({field}, ?) WHERE client_order_id = ?",
+                                   (value, client_order_id))
+
     def create_intent(self, values: dict[str, Any], *, protection: tuple[float, int, int] | None = None,
-                      execution_version: str = "minute-v1", sizing: dict[str, str] | None = None) -> None:
+                      execution_version: str = "minute-v1", sizing: dict[str, str] | None = None,
+                      run_id: str | None = None) -> None:
         now = _utc_now()
         required = {"intent_id", "strategy", "symbol", "position_side", "decision_time", "planned_exit_time", "units", "priority_score", "client_order_id"}
         if set(values) != required:
@@ -449,6 +474,7 @@ class StateStore:
                  *[(sizing or {}).get(key) for key in ("base_unit_capital", "pre_entry_equity", "pre_entry_peak", "pre_entry_drawdown", "exposure_multiplier", "target_notional")],
                  (sizing or {}).get("sizing_version", "legacy-1x")),
             )
+            connection.execute("UPDATE intents SET run_id = ? WHERE intent_id = ?", (run_id, values["intent_id"]))
 
     def intent(self, intent_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM intents WHERE intent_id = ?", (intent_id,)).fetchone()
@@ -476,6 +502,8 @@ class StateStore:
                 str(response.get("executedQty", "0")), str(response.get("avgPrice", "0")), _exchange_time(response), _utc_now(),
             ),
         )
+        connection.execute("UPDATE execution_timing SET exchange_at = ? WHERE client_order_id = ?",
+                           (_exchange_time(response), client_order_id))
         if exchange_order_id:
             connection.execute(
                 """UPDATE trade_fills SET intent_id = ? WHERE order_id = ? AND intent_id IS NULL
@@ -862,7 +890,7 @@ class StateStore:
                    SET completed_at = ?, universe_size = ?, candidate_count = ?, admission_count = ?,
                        status = ?, detail_json = ?, error = ?
                    WHERE decision_time = ?""",
-                (_utc_now(), universe_size, len(candidates), len(admissions), "FAILED" if error else "COMPLETE", detail, error, decision_time),
+                (_utc_now(), universe_size, len(candidates), sum(a.get("outcome", "OPEN") == "OPEN" for a in admissions), "FAILED" if error else "COMPLETE", detail, error, decision_time),
             )
             if cursor.rowcount != 1:
                 raise StateError(f"decision was not started: {decision_time}")

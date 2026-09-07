@@ -74,7 +74,12 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
     by_entry: dict[Any, list[dict[str, Any]]] = {}
     for row in candidates:
         by_entry.setdefault(row["entry_time"], []).append(dict(row))
-    events = sorted({row["entry_time"] for row in candidates} | {row["exit_time"] for row in candidates})
+    events = {row["entry_time"] for row in candidates} | {row["exit_time"] for row in candidates}
+    if candidates and funding is not None and not funding.is_empty():
+        lower, upper = min(events), max(events)
+        events.update(t.replace(second=0, microsecond=0) + (timedelta(minutes=1) if t.second or t.microsecond else timedelta())
+                      for t in funding["funding_time"].to_list() if lower < t <= upper)
+    events = sorted(events)
     minute_rows = minutes.to_dicts() if minutes is not None and not minutes.is_empty() else []
     minute_close = {
         (str(row["symbol"]), row["open_time"] + timedelta(minutes=1)): float(row["close"])
@@ -97,17 +102,58 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
     def occupied() -> int:
         return sum(int(position["units"]) for position in positions.values())
 
+    def register(position: dict[str, Any]) -> None:
+        nonlocal cash
+        strategy = position["strategy"]
+        position["entry_fill"] = float(position.get("entry_fill") or
+            float(position["entry_reference"]) * (1 + config.values["long"]["slippage_per_side"] if strategy == "long" else 1))
+        cost = position.get("entry_cost_return")
+        if cost is None:
+            cost = -config.values["long"]["taker_fee_per_side"] if strategy == "long" else position["cost_return"] / 2
+        position["entry_cost_return"] = float(cost)
+        position["_booked_cashflow"] = position["notional"] * float(cost)
+        position["_funding_events"] = sorted(
+            (event for event in funding_by_symbol.get(position["symbol"], [])
+             if strategy == "long" and position["entry_time"] < event["funding_time"] <= position["exit_time"]),
+            key=lambda event: event["funding_time"],
+        )
+        position["_funding_index"] = 0
+        cash += position["_booked_cashflow"]
+        positions[(strategy, position["symbol"])] = position
+
+    def settle_funding(when) -> None:
+        nonlocal cash
+        for position in positions.values():
+            if position["strategy"] != "long":
+                continue  # Frozen short stress model deliberately excludes funding.
+            pending = position["_funding_events"]
+            while position["_funding_index"] < len(pending):
+                event = pending[position["_funding_index"]]
+                if event["funding_time"] > min(when, position["exit_time"]):
+                    break
+                key = (position["symbol"], event["funding_time"].replace(second=0, microsecond=0))
+                boundary = position.get("extension_deadline")
+                at_boundary = (boundary is not None and event["funding_time"] == boundary
+                               and boundary < position["planned_exit_time"] + timedelta(hours=config.values["long"]["extension"]["maximum_extension_hours"]))
+                price = (minute_close.get(key) if at_boundary
+                         else minute_open.get(key))
+                if price is None:
+                    raise PortfolioError(f"missing funding settlement price: {key}")
+                amount = -position["notional"] * float(event["funding_rate"]) * price / position["entry_fill"]
+                cash += amount
+                position["_booked_cashflow"] += amount
+                position["_funding_index"] += 1
+
     def marked_equity(when) -> float:
         value = cash
         for position in positions.values():
-            if position["entry_time"] >= when:
-                continue
-            close = minute_close.get((str(position["symbol"]), when))
+            close = (float(position["entry_reference"]) if position["entry_time"] == when
+                     else minute_close.get((str(position["symbol"]), when)))
             if close is None:
                 if minutes is not None:
                     raise PortfolioError(f"missing completed minute close for {position['symbol']} at {when}")
                 continue
-            entry = float(position["entry_reference"])
+            entry = float(position["entry_fill"])
             # USD-M contracts are linear.  A short entered at 100 and marked
             # at 80 earns +20% of its entry notional, not +25%.
             change = close / entry - 1 if position["strategy"] == "long" else 1 - close / entry
@@ -152,8 +198,8 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
                 position["mae_return"] = min(0.0, float(path.get_column("low").min()) / position["entry_reference"] - 1)
                 position["mfe_return"] = max(0.0, float(path.get_column("high").max()) / position["entry_reference"] - 1)
         position["pnl"] = position["notional"] * position["net_return"]
-        cash += position["pnl"]
-        accepted.append(position.copy())
+        cash += position["pnl"] - position["_booked_cashflow"]
+        accepted.append({key: value for key, value in position.items() if not key.startswith("_")})
         del positions[(position["strategy"], position["symbol"])]
 
     def mark_through(before) -> None:
@@ -162,6 +208,7 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
             return
         current = last_mark + timedelta(minutes=1)
         while current < before:
+            settle_funding(current)
             equity = marked_equity(current)
             peak = max(peak, equity)
             account.append({"event_time": current, "realized_equity": cash, "marked_equity": equity,
@@ -170,6 +217,7 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
 
     for event_time in events:
         mark_through(event_time)
+        settle_funding(event_time)
         for position in list(positions.values()):
             if position["exit_time"] <= event_time:
                 close(position, position["exit_time"])
@@ -236,7 +284,7 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
             position = dict(row, units=actual_units, notional=target, base_unit_capital=base_unit, pre_entry_equity=equity, pre_entry_peak=peak,
                             pre_entry_drawdown=drawdown, exposure_multiplier=batch_multiplier, target_notional=target,
                             allocation_mode="SINGLE_UNIT_FRAGMENT" if fragment else "STANDARD")
-            positions[("long", row["symbol"])] = position
+            register(position)
             if fragment:
                 counts["LONG_SINGLE_UNIT_FRAGMENT"] += 1
             audit_row(row, "SELECTED_FRAGMENT" if fragment else "SELECTED", successful_longs, before)
@@ -253,8 +301,8 @@ def replay_portfolio(long_trades: pl.DataFrame, short_trades: pl.DataFrame, hour
                 audit_row(row, "SHORT_SKIP_NO_FUNDS", successful_longs, before)
                 continue
             target = base_unit * requested * batch_multiplier
-            positions[key] = dict(row, notional=target, base_unit_capital=base_unit, pre_entry_equity=equity, pre_entry_peak=peak,
-                                  pre_entry_drawdown=drawdown, exposure_multiplier=batch_multiplier, target_notional=target)
+            register(dict(row, notional=target, base_unit_capital=base_unit, pre_entry_equity=equity, pre_entry_peak=peak,
+                          pre_entry_drawdown=drawdown, exposure_multiplier=batch_multiplier, target_notional=target))
             audit_row(row, "SELECTED", successful_longs, before)
         account.append({"event_time": event_time, "realized_equity": cash, "marked_equity": marked_equity(event_time),
                         "cash": cash, "open_units": occupied(), "open_positions": len(positions)})

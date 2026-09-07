@@ -1,4 +1,6 @@
 FROM python:3.11-slim
+ARG SOURCE_REVISION=unknown
+ENV SOURCE_REVISION=$SOURCE_REVISION
 
 WORKDIR /app
 COPY pyproject.toml strategy.toml testnet.toml README.md /app/

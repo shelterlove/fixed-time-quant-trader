@@ -8,12 +8,12 @@ from typing import Any
 import polars as pl
 
 from .storage import DataError
-from .config import StrategyConfig
+from .config import StrategyConfig, Window
 
 
 TRADE_COLUMNS = [
     "trade_id", "strategy", "symbol", "signal_time", "entry_time", "planned_exit_time", "exit_time",
-    "entry_reference", "exit_reference", "exit_reason", "units", "notional", "gross_return",
+    "entry_reference", "entry_fill", "entry_cost_return", "exit_reference", "exit_reason", "units", "notional", "gross_return",
     "cost_return", "funding_return", "net_return", "pnl", "mae_return", "mfe_return", "priority_score",
     "priority_order",
     "visible_hourly_close",
@@ -123,7 +123,20 @@ def funding_requirements(long_signals: pl.DataFrame) -> set[tuple[str, int, int]
     return required
 
 
-def extension_requirements(trades: pl.DataFrame, config: StrategyConfig) -> tuple[set[tuple[str, datetime]], set[tuple[str, int, int]]]:
+def _extension_deadline(row: dict, config: StrategyConfig, window: Window | None) -> datetime:
+    deadline = row["planned_exit_time"] + timedelta(hours=config.values["long"]["extension"]["maximum_extension_hours"])
+    if window is not None:
+        boundary = window.end_exclusive
+        if window.id == "research":
+            boundary = next((end for start, end in window.subwindows
+                             if start <= row["signal_time"] < end), boundary)
+        if row["planned_exit_time"] > boundary:
+            raise DataError("base trade exceeds its research boundary")
+        deadline = min(deadline, boundary)
+    return deadline
+
+
+def extension_requirements(trades: pl.DataFrame, config: StrategyConfig, window: Window | None = None) -> tuple[set[tuple[str, datetime]], set[tuple[str, int, int]]]:
     """Return only the extra dates needed by long trades eligible for the selected extension."""
     if trades.is_empty():
         return set(), set()
@@ -134,25 +147,26 @@ def extension_requirements(trades: pl.DataFrame, config: StrategyConfig) -> tupl
         & pl.col("protection_activated_at").is_not_null()
         & (pl.col("protection_activated_at") > pl.col("planned_exit_time") - lookback)
         & (pl.col("protection_activated_at") <= pl.col("planned_exit_time"))
-    ).select("symbol", "planned_exit_time").to_dicts()
+    ).to_dicts()
     minute_days: set[tuple[str, datetime]] = set()
     funding_months: set[tuple[str, int, int]] = set()
-    extension = timedelta(hours=policy["maximum_extension_hours"])
     for row in eligible:
         current = row["planned_exit_time"].replace(hour=0, minute=0, second=0, microsecond=0)
-        deadline = row["planned_exit_time"] + extension
+        deadline = _extension_deadline(row, config, window)
+        if deadline <= row["planned_exit_time"]:
+            continue
         while current < deadline:
             minute_days.add((row["symbol"], current))
             current += timedelta(days=1)
         current = row["planned_exit_time"].replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        while current < deadline:
+        while current <= deadline:
             funding_months.add((row["symbol"], current.year, current.month))
             current = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
     return minute_days, funding_months
 
 
 def extend_long_trades(trades: pl.DataFrame, minutes: pl.DataFrame, funding: pl.DataFrame,
-                       config: StrategyConfig) -> tuple[pl.DataFrame, pl.DataFrame]:
+                       config: StrategyConfig, window: Window | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Apply the frozen 4h/24h extension to eligible completed base trades."""
     if trades.is_empty():
         return trades, pl.DataFrame(schema={name: pl.Null for name in FUNDING_EVENT_COLUMNS})
@@ -175,7 +189,11 @@ def extend_long_trades(trades: pl.DataFrame, minutes: pl.DataFrame, funding: pl.
         if not eligible:
             result.append(row)
             continue
-        deadline = row["planned_exit_time"] + extension
+        deadline = _extension_deadline(row, config, window)
+        if deadline <= row["planned_exit_time"]:
+            row["exit_reason"] = "WINDOW_END"
+            result.append(row)
+            continue
         frame = by_symbol.get(row["symbol"])
         if frame is None:
             raise DataError(f"missing extension minute data for {row['symbol']}")
@@ -184,14 +202,16 @@ def extend_long_trades(trades: pl.DataFrame, minutes: pl.DataFrame, funding: pl.
                                  float(row["protection_allowed_retrace"]), rules)
         if outcome.exit_time <= row["planned_exit_time"]:
             raise DataError(f"extension replay disagrees with base path for {row['trade_id']}")
-        exit_reason = "EXTENSION_CAP" if outcome.exit_reason == "PLANNED_EXIT" else outcome.exit_reason
+        exit_reason = (("WINDOW_END" if deadline < row["planned_exit_time"] + extension else "EXTENSION_CAP")
+                       if outcome.exit_reason == "PLANNED_EXIT" else outcome.exit_reason)
         entry_fill = float(row["entry_reference"]) * (1 + rules["slippage_per_side"])
         funding_return = 0.0
         for event in funding_by_symbol.get(row["symbol"], []):
             if not row["entry_time"] < event["funding_time"] <= outcome.exit_time:
                 continue
             settlement = event["funding_time"].replace(second=0, microsecond=0)
-            price = minute_opens[row["symbol"]].get(settlement)
+            price = (float(prefix[-1]["close"]) if deadline < row["planned_exit_time"] + extension and event["funding_time"] == deadline
+                     else minute_opens[row["symbol"]].get(settlement))
             if price is None:
                 raise DataError(f"missing settlement minute for {row['symbol']} at {settlement.isoformat()}")
             contribution = -float(event["funding_rate"]) * price / entry_fill
@@ -322,7 +342,8 @@ def execute_long_with_funding_diagnostics(
         rows.append({
             "trade_id": signal["trade_id"], "strategy": "long", "symbol": signal["symbol"], "signal_time": signal["decision_time"],
             "entry_time": entry, "planned_exit_time": signal["planned_exit_time"], "exit_time": outcome.exit_time,
-            "entry_reference": reference, "exit_reference": outcome.exit_reference, "exit_reason": outcome.exit_reason,
+            "entry_reference": reference, "entry_fill": entry_fill, "entry_cost_return": -rules["taker_fee_per_side"],
+            "exit_reference": outcome.exit_reference, "exit_reason": outcome.exit_reason,
             "visible_hourly_close": signal.get("close"),
             "units": signal["requested_units"], "notional": 1.0, "gross_return": gross, "cost_return": cost,
             "funding_return": funding_return, "net_return": gross + cost + funding_return, "pnl": gross + cost + funding_return,
@@ -367,6 +388,7 @@ def execute_short(signals: pl.DataFrame, hourly: pl.DataFrame, config: StrategyC
         rows.append({
             "trade_id": signal["trade_id"], "strategy": "short", "symbol": symbol, "signal_time": signal["decision_time"],
             "entry_time": entry, "planned_exit_time": planned, "exit_time": outcome_time, "entry_reference": entry_reference,
+            "entry_fill": entry_reference, "entry_cost_return": -rules["round_trip_stress_cost"] / 2,
             "exit_reference": outcome_reference, "exit_reason": reason,
             "units": signal.get("requested_units", rules["portfolio"]["units_per_signal"]), "notional": 1.0,
             "visible_hourly_close": entry_reference,

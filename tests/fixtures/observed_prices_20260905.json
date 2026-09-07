@@ -1,0 +1,68 @@
+{
+  "note": "Public signal ranks and normalized price-only regression. No account balances, quantities, order IDs or credentials.",
+  "trades": [
+    {
+      "features": {
+        "symbol": "DASHUSDT",
+        "decision_time": "2026-09-05 08:00:00+00:00",
+        "r1_rank": 99,
+        "r4_rank": 86,
+        "r24_rank": 6,
+        "v1_rank": 5,
+        "v4_rank": 4,
+        "r4_rank_change_rank": 94,
+        "volume_diff_v1_rank": 5,
+        "volume_diff_v4_rank": 4,
+        "market_r1_p10": -0.013591907890200927,
+        "market_r24_p10": -0.03373881110856081
+      },
+      "entry_price": "66.05",
+      "exit_price": "69.34",
+      "maximum_high": 70.65,
+      "minimum_low": 65.78,
+      "position_side": "SHORT"
+    },
+    {
+      "features": {
+        "symbol": "AKEUSDT",
+        "decision_time": "2026-09-05 08:00:00+00:00",
+        "r1_rank": 97,
+        "r4_rank": 100,
+        "r24_rank": 10,
+        "v1_rank": 7,
+        "v4_rank": 8,
+        "r4_rank_change_rank": 98,
+        "volume_diff_v1_rank": 4,
+        "volume_diff_v4_rank": 96,
+        "market_r1_p10": -0.013591907890200927,
+        "market_r24_p10": -0.03373881110856081
+      },
+      "entry_price": "0.0164945",
+      "exit_price": "0.0190580",
+      "maximum_high": 0.0206861,
+      "minimum_low": 0.0164932,
+      "position_side": "SHORT"
+    },
+    {
+      "features": {
+        "symbol": "BULLAUSDT",
+        "decision_time": "2026-09-05 15:00:00+00:00",
+        "r1_rank": 1,
+        "r4_rank": 2,
+        "r24_rank": 1,
+        "v1_rank": 7,
+        "v4_rank": 10,
+        "r4_rank_change_rank": null,
+        "volume_diff_v1_rank": 1,
+        "volume_diff_v4_rank": 84,
+        "market_r1_p10": -0.01000144948543269,
+        "market_r24_p10": -0.00010571942065751294
+      },
+      "entry_price": "0.0740700",
+      "exit_price": "0.0703100",
+      "maximum_high": 0.095,
+      "minimum_low": 0.06515,
+      "position_side": "LONG"
+    }
+  ]
+}
