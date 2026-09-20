@@ -1,0 +1,7 @@
+{
+  "status": "passed",
+  "terminal_cashflow_relative_error": 5.182532921566717e-16,
+  "hourly_ledger_max_relative_error": 4.526217624909997e-15,
+  "open_positions": 0,
+  "held_hour_gaps": 0
+}

@@ -1,0 +1,58 @@
+[
+  {
+    "symbol": "DOGEUSDT",
+    "hour": "2021-01-29 02:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "a4043a45c0112b5bab1435618c1dffc3cf3342dac402a720dff78b4e94710c15"
+  },
+  {
+    "symbol": "DOGEUSDT",
+    "hour": "2021-01-29 03:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "5857ce19291b39c30124711c16b618edec0f68207447182e32e18f5025b9cfd6"
+  },
+  {
+    "symbol": "MYXUSDT",
+    "hour": "2025-08-05 17:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "2bdfe5dd9c64ee0b98968070c7edd63c9fd11298867731790ff976569bafbc0f"
+  },
+  {
+    "symbol": "HIFIUSDT",
+    "hour": "2025-09-12 23:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "14e190b936780342a063ab61fae81697791b8683490b37ae3eac13c93e535101"
+  },
+  {
+    "symbol": "TNSRUSDT",
+    "hour": "2025-11-20 12:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "850308fc5d0a01583968575e8105ac8546611fe05eef916feaf98bf3de199dbf"
+  },
+  {
+    "symbol": "BULLAUSDT",
+    "hour": "2026-02-01 06:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "f2d31a4fc6cb13b56cccad820ab9715ca2a20a8479aae10d3993836f1aa28a33"
+  },
+  {
+    "symbol": "LSKUSDT",
+    "hour": "2026-09-13 03:00:00+00:00",
+    "origin": "cache",
+    "rows": 60,
+    "accepted": true,
+    "sha256": "99ae5a24dec5c1c9ecd6566d5d7e6116bfbbbb4044d971eca329d447c014bec8"
+  }
+]

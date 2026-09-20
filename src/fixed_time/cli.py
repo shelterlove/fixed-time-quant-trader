@@ -1,167 +1,91 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
-from .config import ConfigError, StrategyConfig, load_config
-from .pipeline import bootstrap, resume, run
+from .config import load_live_config, load_strategy
+from .dashboard import serve
+from .engine import Engine
+from .exchange import Binance
+from .state import RuntimeLock, Store
 
 
-_WINDOW_COMMANDS = {
-    "bootstrap": "research",
-    "run": "research",
-    "validate": "external_2021",
-    "forward": "forward_2026_jul_aug",
-}
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="fixed-time")
+    commands = root.add_subparsers(dest="command", required=True)
+    for name in ("strategy-check", "live-check", "live-deploy-check", "live-reconcile", "live-run", "live-health", "live-backup"):
+        item = commands.add_parser(name)
+        item.add_argument("--root", default=".")
+    dashboard = commands.add_parser("live-dashboard")
+    dashboard.add_argument("--root", default=".")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8080)
+    return root
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fixed-time")
-    commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("bootstrap", "run", "resume", "validate"):
-        command = commands.add_parser(name)
-        command.add_argument("--window", required=True)
-        if name == "bootstrap":
-            command.add_argument("--refresh", action="store_true")
-        if name in ("run", "resume"):
-            command.add_argument("--offline", action="store_true", required=True)
-    reconcile = commands.add_parser("reconcile")
-    reconcile.add_argument("--legacy-root", required=True)
-    forward = commands.add_parser("forward")
-    forward.add_argument("--window", required=True)
-    forward.add_argument("--confirm", action="store_true", required=True)
-    live_check = commands.add_parser("live-check", help="validate Binance Futures testnet account configuration")
-    live_check.add_argument("--root", default=".")
-    live_seed = commands.add_parser("live-seed", help="seed rolling P90 history from local frozen results")
-    live_seed.add_argument("--root", default=".")
-    live_run = commands.add_parser("live-run", help="run the REST-only automated Futures testnet engine")
-    live_run.add_argument("--root", default=".")
-    live_smoke = commands.add_parser("live-smoke", help="place and close one minimum-size Futures testnet position")
-    live_smoke.add_argument("--root", default=".")
-    live_smoke.add_argument("--symbol", required=True)
-    live_health = commands.add_parser("live-health", help="check whether the live trader heartbeat is fresh")
-    live_health.add_argument("--root", default=".")
-    live_dashboard = commands.add_parser("live-dashboard", help="serve the read-only live monitoring page")
-    live_dashboard.add_argument("--root", default=".")
-    live_dashboard.add_argument("--host", default="0.0.0.0")
-    live_dashboard.add_argument("--port", type=int, default=8080)
-    return parser
-
-
-def _reconcile(root: Path, legacy_root: Path) -> None:
-    """Deliberately isolated legacy access; run/validate never call this path."""
-    current = root / "results" / "local" / "research" / "summary.csv"
-    legacy = legacy_root / "results" / "summary.csv"
-    if not current.exists() or not legacy.exists():
-        raise ConfigError(f"reconcile needs {current} and {legacy}")
-    with current.open(encoding="utf-8", newline="") as left, legacy.open(encoding="utf-8", newline="") as right:
-        current_row, legacy_row = next(csv.DictReader(left)), next(csv.DictReader(right))
-    print({"current": current_row, "legacy": legacy_row})
-
-
-def _require_research_baseline(config: StrategyConfig) -> None:
-    path = config.root / "results" / "local" / "research" / "run_manifest.json"
-    if not path.exists():
-        raise ConfigError("authorized external windows require a completed research run manifest")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("strategy_version") != config.version or manifest.get("window") != "research" or manifest.get("parameters") != config.values:
-        raise ConfigError("research baseline does not match the frozen strategy")
-
-
-def _authorized_window(config: StrategyConfig, command: str, window_id: str):
-    window = config.window(window_id)
-    expected = _WINDOW_COMMANDS.get(command)
-    if expected is not None and window.id != expected:
-        raise ConfigError(f"{command} only accepts the {expected} window")
-    if command in ("validate", "forward"):
-        _require_research_baseline(config)
-    if command == "resume" and window.id != "research":
-        _require_research_baseline(config)
-    return window
-
-
-def main() -> None:
-    args = _parser().parse_args()
-    if args.command == "live-dashboard":
-        from .live.config import load_live_config
-        from .live.dashboard import run_dashboard
-
-        run_dashboard(load_live_config(args.root).database_path, args.host, args.port)
-        return
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    root = Path(args.root).resolve()
+    if args.command == "strategy-check":
+        strategy = load_strategy(root)
+        print(json.dumps({"strategy_version": strategy.version, "status": "ok"}))
+        return 0
+    config = load_live_config(root)
+    if args.command in {"live-check","live-deploy-check"}:
+        result = Engine.check_exchange(Binance(config))
+        if args.command == "live-deploy-check":
+            if not config.trading_enabled:
+                raise ValueError("deploy requires TRADING_ENABLED=true; use live-check for read-only checks")
+            if not config.database_path.is_relative_to(root / "runtime"):
+                raise ValueError("Docker deployment requires DATABASE_PATH inside /app/runtime")
+            legacy = False
+            if config.database_path.exists():
+                with sqlite3.connect(config.database_path.as_uri()+"?mode=ro",uri=True) as db:
+                    tables = {x[0] for x in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    migrated = "v2_meta" in tables and db.execute("SELECT 1 FROM v2_meta WHERE key='legacy_open_positions_imported'").fetchone()
+                    legacy = "positions" in tables and not migrated
+                    if legacy and db.execute("SELECT 1 FROM positions WHERE status='OPEN' LIMIT 1").fetchone():
+                        raise ValueError("legacy upgrade requires flat local positions; finish trades with the previous version first")
+            if legacy and any(result[k] for k in ("positions","open_orders","open_algos")):
+                raise ValueError("legacy upgrade requires a flat exchange account with no pending orders")
+            print("Deployment preflight passed")
+        else:
+            print(json.dumps(result,default=str))
+        return 0
+    if args.command == "live-backup":
+        with RuntimeLock(config.database_path):
+            if not config.database_path.exists():
+                print("No existing database to back up")
+                return 0
+            target = config.database_path.parent / "backups" / (datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + ".sqlite3")
+            target.parent.mkdir(parents=True,exist_ok=True)
+            with sqlite3.connect(config.database_path.as_uri()+"?mode=ro",uri=True) as source, sqlite3.connect(target) as backup:
+                source.backup(backup)
+            print(f"Database backup: {target}")
+        return 0
     if args.command == "live-health":
-        from datetime import UTC, datetime, timedelta
-        import sqlite3
-        from .live.config import load_live_config
-
-        live_config = load_live_config(args.root)
-        if not live_config.database_path.exists():
-            raise ConfigError("live runtime database does not exist")
-        connection = sqlite3.connect(f"{live_config.database_path.as_uri()}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
+        from .dashboard import snapshot
+        status = snapshot(config.database_path)
+        print(json.dumps(status, default=str))
+        return 0 if status["healthy"] else 1
+    if args.command == "live-dashboard":
+        serve(config.database_path, args.host, args.port)
+        return 0
+    with RuntimeLock(config.database_path):
+        engine = Engine(config)
         try:
-            status = connection.execute("SELECT * FROM runtime_status WHERE singleton = 1").fetchone()
-        finally:
-            connection.close()
-        if status is None or datetime.fromisoformat(status["heartbeat_at"]) < datetime.now(UTC) - timedelta(seconds=30):
-            raise ConfigError("live trader heartbeat is stale")
-        print({"status": "healthy", "heartbeat_at": status["heartbeat_at"]})
-        return
-    if args.command == "live-check":
-        from .live.binance import BinanceRest
-        from .live.config import load_live_config
-
-        client = BinanceRest(load_live_config(args.root))
-        account = client.account_check()
-        for position in account["positions"]:
-            client.ensure_symbol_config(str(position["symbol"]))
-        print(account)
-        return
-    if args.command.startswith("live-"):
-        from .live.config import load_live_config
-        from .live.engine import LiveEngine
-        from .live.state import RuntimeLock
-
-        live_config = load_live_config(args.root)
-        # These commands can write the durable trade state or submit orders.
-        # A read-only account check deliberately remains available while the
-        # trader is running.
-        lock = RuntimeLock(live_config.database_path)
-        engine = None
-        try:
-            if lock is not None:
-                lock.acquire()
-            engine = LiveEngine(live_config)
-            if args.command == "live-seed":
-                print({"inserted_shadow_records": engine.seed_shadow_history()})
-            elif args.command == "live-smoke":
-                print(engine.smoke_test(args.symbol))
+            if args.command == "live-reconcile":
+                engine.check()
+                print(json.dumps({"reconciled": engine.reconcile(), "incidents": engine.store.incidents()}, default=str))
             else:
                 engine.run_forever()
         finally:
-            if engine is not None:
-                engine.close()
-            if lock is not None:
-                lock.release()
-        return
-    config = load_config()
-    if args.command == "reconcile":
-        _reconcile(config.root, Path(args.legacy_root))
-        return
-    window = _authorized_window(config, args.command, args.window)
-    if args.command == "validate":
-        result = bootstrap(config, window, refresh=False)
-    elif args.command == "forward":
-        result = bootstrap(config, window, refresh=False)
-    elif args.command == "bootstrap":
-        result = bootstrap(config, window, args.refresh)
-    elif args.command == "run":
-        result = run(config, window, offline=True)
-    else:
-        result = resume(config, window, offline=True)
-    print(f"strategy={config.version} window={args.window} result={result}")
+            engine.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

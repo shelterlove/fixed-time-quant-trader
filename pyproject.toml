@@ -4,9 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fixed-time-portfolio"
-version = "1.7.0"
+dynamic = ["version"]
 requires-python = ">=3.11"
-dependencies = ["polars==1.32.0"]
+dependencies = ["numpy==2.3.3", "polars==1.32.0", "tzdata>=2025.2"]
+
+[tool.setuptools.dynamic]
+version = {attr = "fixed_time.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fixed_time = ["dashboard.html"]
 
 [project.optional-dependencies]
 test = ["pytest==9.1.1"]

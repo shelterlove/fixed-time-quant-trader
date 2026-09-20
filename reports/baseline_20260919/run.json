@@ -1,0 +1,32 @@
+{
+  "created_at": "2026-09-20 00:41:41.321481+00:00",
+  "fingerprint": {
+    "strategy": "c419f08504f7172b0f085574ecc21946da851e0e3644b3acf60782a4ea30cd80",
+    "data_manifest": "3baed88d2eefce06204f0ed2ff24508cc7cbefdee6078c1d2b8abacd9d5a2918",
+    "code": {
+      "__init__.py": "97102ca54bbf654922ab510422d145248836eb34f349381079ebc16806c59a08",
+      "cli.py": "547e91c60cbad2d4bad9301111fb031e78db3077d0f6834cec99bb590844e548",
+      "config.py": "96276175171eaf0cf1b9ff756d55a0e03cdff95f98a39c11b40d97d8b55a39d6",
+      "dashboard.py": "624ba14ef2b0a69e616ebe48155557af570c943fee6867b9b1a055d2402e9a5e",
+      "engine.py": "90aebcfba4a97b5b52ebd0e0cd2642198e4dc2b482bf5a12d0326e87ddf72b95",
+      "exchange.py": "01530addbdd4e0220a106bf8ba301fa5b958f75e8dfc2204aab1b92a065dcd6e",
+      "research\\__init__.py": "b27bd92d4d540a177a65637d061403ef02562aeb6705287217bb4a9ab95e26da",
+      "research\\__main__.py": "7f4a3215f701b52497dc41d4c5a7be43a0614574662e38a7063f6c95cbd34546",
+      "research\\data.py": "e3323a1d83cfb3ed9b7fb4144d14bd85c268169b179aa3493fecec27ff1bd5bc",
+      "research\\exits.py": "a32b4eef8d581be16f4cec0667f24778fc939a5d531f969fd3fe239dc078123d",
+      "research\\replay.py": "fe366901a3393053726ac3ac9e6bec7a4a10a26208ba53b9845cd0454b8afd94",
+      "research\\report.py": "82f813673bec1741e90ac047417dbfe4329a3bcdc75fddfdd321908c5cdbd46a",
+      "state.py": "6f9bd95ce10d9ef196396c3ffdd40686c3a5ddd5fd44002f0b00b96537dc3446",
+      "strategy.py": "ce879bc3a394bc4870802543ba4a76f2b823db89bbce4cfa7a95f2fefbede6d2"
+    }
+  },
+  "snapshot": "D:\\Quant_develop\\data\\snapshots\\baseline_20260919_verified",
+  "git_revision": "8a0b300191eb438750be03ce11db52265ef035e6",
+  "git_dirty": true,
+  "python": "3.12.10",
+  "packages": {
+    "numpy": "2.4.6",
+    "polars": "1.32.0"
+  },
+  "minute_policy": "local first; missing required hour only; complete 60 bars and aggregate match; then worst feasible intraminute path"
+}

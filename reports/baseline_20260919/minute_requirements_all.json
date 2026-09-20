@@ -1,0 +1,58 @@
+[
+  {
+    "symbol": "DOGEUSDT",
+    "hour": "2021-01-29 02:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:MAIN:DOGEUSDT:2021-01-28T14:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.012852,
+    "armed_before": false
+  },
+  {
+    "symbol": "DOGEUSDT",
+    "hour": "2021-01-29 03:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:MAIN:DOGEUSDT:2021-01-28T17:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.018657,
+    "armed_before": false
+  },
+  {
+    "symbol": "MYXUSDT",
+    "hour": "2025-08-05 17:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:MAIN:MYXUSDT:2025-08-04T17:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.41678,
+    "armed_before": false
+  },
+  {
+    "symbol": "HIFIUSDT",
+    "hour": "2025-09-12 23:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:MAIN:HIFIUSDT:2025-09-12T14:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.16417,
+    "armed_before": false
+  },
+  {
+    "symbol": "TNSRUSDT",
+    "hour": "2025-11-20 12:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:A|C:TNSRUSDT:2025-11-19T14:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.07141,
+    "armed_before": false
+  },
+  {
+    "symbol": "BULLAUSDT",
+    "hour": "2026-02-01 06:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:A:BULLAUSDT:2026-01-31T14:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.09898,
+    "armed_before": false
+  },
+  {
+    "symbol": "LSKUSDT",
+    "hour": "2026-09-13 03:00:00+00:00",
+    "trade_id": "SPEC-20260917-r2:long:A|C:LSKUSDT:2026-09-12T14:00:00+00:00",
+    "reason": "EXIT_ORDER_AMBIGUITY",
+    "reference": 0.23214,
+    "armed_before": false
+  }
+]

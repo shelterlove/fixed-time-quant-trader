@@ -3,11 +3,13 @@
 .pytest_cache
 __pycache__
 *.pyc
-logs
+build
+dist
+docs
 runtime
-research
-legacy_research
 data
-results
+artifacts
+reports
+*.log
 .env.*
 !.env.example

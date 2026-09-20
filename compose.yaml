@@ -2,6 +2,7 @@ services:
   trader:
     build:
       context: .
+      target: production
       args:
         SOURCE_REVISION: ${SOURCE_REVISION:-unknown}
     command: ["python", "-m", "fixed_time.cli", "live-run", "--root", "/app"]
@@ -23,20 +24,21 @@ services:
   dashboard:
     build:
       context: .
+      target: production
       args:
         SOURCE_REVISION: ${SOURCE_REVISION:-unknown}
     command: ["python", "-m", "fixed_time.cli", "live-dashboard", "--root", "/app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      DATABASE_PATH: /app/runtime/testnet.sqlite3
+      DATABASE_PATH: ${DATABASE_PATH:-/app/runtime/testnet.sqlite3}
       TRADING_ENABLED: "false"
     restart: unless-stopped
     depends_on:
       trader:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ./runtime:/app/runtime:ro
     ports:
-      - "8080:8080"
+      - "${DASHBOARD_BIND:-127.0.0.1}:8080:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
       interval: 15s
