@@ -534,7 +534,8 @@ class Engine:
             if self.store.blocked() or self.store.pending_orders():
                 return plan
             outcome = self._open(item)
-            outcomes.append({"symbol":item.candidate["symbol"],"target_notional":str(item.target_notional),"outcome":outcome})
+            outcomes.append({"trade_id":item.candidate.get("trade_id"),"symbol":item.candidate["symbol"],
+                             "target_notional":str(item.target_notional),"outcome":outcome})
             self.store.save_decision(key,"RUNNING",detail)
         self.store.save_decision(key, "COMPLETE", detail)
         return plan

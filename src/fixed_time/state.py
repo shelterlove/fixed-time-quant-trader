@@ -151,6 +151,8 @@ class Store:
                 db.execute("""UPDATE v2_orders SET applied_quantity=executed_quantity,settled=1
                     WHERE status NOT IN ('SUBMITTED','NEW','PARTIALLY_FILLED','UNKNOWN')
                     AND (role='EXIT' OR lot_id IN (SELECT lot_id FROM v2_lots))""")
+            if "filled_at" not in order_columns:
+                db.execute("ALTER TABLE v2_orders ADD COLUMN filled_at TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS v2_algos (
                 client_id TEXT PRIMARY KEY,lot_id TEXT NOT NULL,kind TEXT NOT NULL,
                 quantity TEXT NOT NULL,trigger_price TEXT NOT NULL,algo_id TEXT,
@@ -291,8 +293,9 @@ class Store:
                                (executed_at.date().isoformat(),lot["symbol"],utc_now()))
             settled = int(status in {"FILLED","CANCELED","EXPIRED","EXPIRED_IN_MATCH","REJECTED","NOT_FOUND"})
             db.execute("""UPDATE v2_orders SET status=?,exchange_order_id=?,executed_quantity=?,average_price=?,
-                applied_quantity=?,settled=?,updated_at=? WHERE client_id=?""",
-                (status,str(response.get("orderId", "")),str(filled),str(average),str(filled),settled,utc_now(),client_id))
+                applied_quantity=?,settled=?,filled_at=COALESCE(?,filled_at),updated_at=? WHERE client_id=?""",
+                (status,str(response.get("orderId", "")),str(filled),str(average),str(filled),settled,
+                 executed_at.isoformat() if delta > 0 else None,utc_now(),client_id))
 
     def algos(self, lot_id: str | None = None) -> list[dict]:
         return [dict(x) for x in self.connection.execute(
