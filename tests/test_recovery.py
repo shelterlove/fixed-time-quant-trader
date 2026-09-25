@@ -109,6 +109,118 @@ def test_missing_exit_fill_is_recovered_once_on_next_reconcile(tmp_path):
     engine.close()
 
 
+def test_adl_exit_is_verified_and_reconciled_once(tmp_path):
+    store = Store(tmp_path / "state.db")
+    add_lot(store)
+    store.begin_algo("stop-client", store.lot("lot"), "stop", Decimal("130"))
+    store.update_algo("stop-client", "stop-id", "ACKNOWLEDGED")
+    store.set_algos("lot", stop="stop-id")
+    exchange = FlatExchange()
+    open_stops = [{"algoId": "stop-id", "symbol": "ABCUSDT"}]
+    exchange.open_algos = lambda: list(open_stops)
+    exchange.cancel_algo = lambda symbol, algo_id: open_stops.clear()
+    forced_at = datetime(2026, 9, 19, 11, 11, 29, tzinfo=UTC)
+    order = {"orderId": 345, "clientOrderId": "adl_autoclose", "symbol": "ABCUSDT",
+             "side": "BUY", "positionSide": "SHORT", "status": "FILLED",
+             "executedQty": "2", "avgPrice": "80", "updateTime": int(forced_at.timestamp() * 1000)}
+    exchange.force_orders = lambda symbol: [order]
+    exchange.query_order_id = lambda symbol, order_id: order
+    exchange.user_trades = lambda symbol, order_id: [
+        {"orderId": 345, "side": "BUY", "positionSide": "SHORT", "qty": "2"}]
+    engine = Engine(live_config(tmp_path), exchange, store)
+    assert engine.reconcile()
+    lot = store.lot("lot")
+    assert lot["status"] == "CLOSED"
+    assert lot["quantity"] == "0"
+    assert lot["exit_reason"] == "EXCHANGE_ADL"
+    assert lot["closed_at"] == forced_at.isoformat()
+    assert store.order("force:ABCUSDT:345")["applied_quantity"] == "2"
+    assert open_stops == []
+    assert engine.reconcile()
+    assert store.connection.execute("SELECT COUNT(*) FROM v2_orders WHERE role='EXIT'").fetchone()[0] == 1
+    engine.close()
+
+
+def test_adl_quantity_disagreement_keeps_ledger_blocked(tmp_path):
+    store = Store(tmp_path / "state.db")
+    add_lot(store)
+    exchange = FlatExchange()
+    exchange.force_orders = lambda symbol: [{"orderId": 345, "clientOrderId": "adl_autoclose",
+        "symbol": "ABCUSDT", "side": "BUY", "positionSide": "SHORT", "status": "FILLED",
+        "executedQty": "1", "updateTime": int(NOW.timestamp() * 1000)}]
+    exchange.query_order_id = lambda *args: pytest.fail("ambiguous forced close must not be applied")
+    engine = Engine(live_config(tmp_path), exchange, store)
+    assert not engine.reconcile()
+    assert store.lot("lot")["status"] == "OPEN"
+    assert any(x["code"] == "POSITION_QUANTITY_MISMATCH" for x in store.incidents())
+    engine.close()
+
+
+def test_partial_adl_keeps_remaining_lot_open_and_resizes_stop(tmp_path):
+    store = Store(tmp_path / "state.db")
+    add_lot(store)
+    store.begin_algo("old-client", store.lot("lot"), "stop", Decimal("130"))
+    store.update_algo("old-client", "old-stop", "ACKNOWLEDGED")
+    store.set_algos("lot", stop="old-stop")
+    exchange = FlatExchange()
+    exchange.positions = lambda: [{"symbol": "ABCUSDT", "positionSide": "SHORT", "positionAmt": "-1.5"}]
+    open_stops = [{"algoId": "old-stop", "symbol": "ABCUSDT", "triggerPrice": "130", "quantity": "2"}]
+    exchange.open_algos = lambda: list(open_stops)
+    exchange.cancel_algo = lambda symbol, algo_id: open_stops.__setitem__(slice(None),
+        [x for x in open_stops if x["algoId"] != algo_id])
+    exchange.query_algo_id = lambda symbol, algo_id: {
+        "actualOrderId": "0", "algoStatus": "CANCELED" if algo_id == "old-stop" else "NEW"}
+    exchange.query_algo_client = lambda symbol, client: {
+        "algoId": "old-stop" if client == "old-client" else "new-stop",
+        "algoStatus": "CANCELED" if client == "old-client" else "NEW"}
+    def place(*args):
+        open_stops.append({"algoId": "new-stop", "symbol": "ABCUSDT",
+                           "triggerPrice": str(args[4]), "quantity": str(args[3])})
+        return {"algoId": "new-stop"}
+    exchange.conditional_order = place
+    forced_at = datetime(2026, 9, 19, 11, 11, 29, tzinfo=UTC)
+    order = {"orderId": 346, "clientOrderId": "adl_autoclose", "symbol": "ABCUSDT",
+             "side": "BUY", "positionSide": "SHORT", "status": "FILLED",
+             "executedQty": "0.5", "avgPrice": "80", "updateTime": int(forced_at.timestamp() * 1000)}
+    exchange.force_orders = lambda symbol: [order]
+    exchange.query_order_id = lambda symbol, order_id: order
+    exchange.user_trades = lambda symbol, order_id: [
+        {"orderId": 346, "side": "BUY", "positionSide": "SHORT", "qty": "0.5"}]
+    engine = Engine(live_config(tmp_path), exchange, store)
+    assert engine.reconcile()
+    lot = store.lot("lot")
+    assert lot["status"] == "OPEN"
+    assert lot["quantity"] == "1.5"
+    assert Decimal(lot["entry_notional"]) == Decimal("150")
+    assert lot["exit_reason"] is None
+    assert lot["stop_algo_id"] == "new-stop"
+    assert open_stops[0]["quantity"] == "1.5"
+    assert engine.reconcile()
+    assert store.connection.execute("SELECT COUNT(*) FROM v2_orders WHERE role='EXIT'").fetchone()[0] == 1
+    engine.close()
+
+
+def test_adl_receipt_recovers_after_crash_between_intent_and_apply(tmp_path):
+    store = Store(tmp_path / "state.db")
+    add_lot(store)
+    store.begin_order({"client_id": "force:ABCUSDT:347", "lot_id": "lot", "role": "EXIT",
+                       "symbol": "ABCUSDT", "side": "BUY", "position_side": "SHORT",
+                       "requested_quantity": "2", "reason": "EXCHANGE_ADL"})
+    exchange = FlatExchange()
+    order = {"orderId": 347, "clientOrderId": "adl_autoclose", "symbol": "ABCUSDT",
+             "side": "BUY", "positionSide": "SHORT", "status": "FILLED",
+             "executedQty": "2", "avgPrice": "80", "updateTime": int(NOW.timestamp() * 1000)}
+    exchange.query_order_id = lambda symbol, order_id: order
+    exchange.user_trades = lambda symbol, order_id: [
+        {"orderId": 347, "side": "BUY", "positionSide": "SHORT", "qty": "2"}]
+    engine = Engine(live_config(tmp_path), exchange, store)
+    assert engine.reconcile()
+    assert store.lot("lot")["status"] == "CLOSED"
+    assert store.pending_orders() == []
+    assert engine.reconcile()
+    engine.close()
+
+
 def test_partial_algo_fill_reconciliation_does_not_double_subtract(tmp_path):
     store = Store(tmp_path/"state.db")
     add_lot(store)

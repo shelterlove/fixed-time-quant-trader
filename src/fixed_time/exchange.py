@@ -317,3 +317,10 @@ class Binance:
         if not isinstance(row,list):
             raise ExchangeError("invalid user trades response")
         return row
+
+    def force_orders(self, symbol: str) -> list[dict]:
+        row = self._request("GET", self.config.trading_base_url, "/fapi/v1/forceOrders",
+                            {"symbol": symbol, "limit": "100"}, signed=True)
+        if not isinstance(row, list):
+            raise ExchangeError("invalid force orders response")
+        return row

@@ -99,7 +99,7 @@ class Store:
                     protection_version TEXT,
                     first_extension_activation TEXT, profit_armed_at TEXT,
                     extended INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'OPEN',
-                    exit_reason TEXT, opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    exit_reason TEXT, closed_at TEXT, opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS v2_orders (
                     client_id TEXT PRIMARY KEY, lot_id TEXT, role TEXT NOT NULL,
@@ -140,6 +140,8 @@ class Store:
             columns = {row[1] for row in db.execute("PRAGMA table_info(v2_lots)")}
             if "protection_version" not in columns:
                 db.execute("ALTER TABLE v2_lots ADD COLUMN protection_version TEXT")
+            if "closed_at" not in columns:
+                db.execute("ALTER TABLE v2_lots ADD COLUMN closed_at TEXT")
             order_columns = {row[1] for row in db.execute("PRAGMA table_info(v2_orders)")}
             if "applied_quantity" not in order_columns:
                 db.execute("ALTER TABLE v2_orders ADD COLUMN applied_quantity TEXT NOT NULL DEFAULT '0'")
@@ -278,8 +280,12 @@ class Store:
                 if lot is None or lot["status"] != "OPEN" or delta > Decimal(lot["quantity"]):
                     raise StateError(f"exit fill exceeds recorded lot: {client_id}")
                 remaining = Decimal(lot["quantity"])-delta
-                db.execute("UPDATE v2_lots SET quantity=?,status=?,exit_reason=?,updated_at=? WHERE lot_id=?",
-                           (str(remaining),"OPEN" if remaining else "CLOSED",None if remaining else order["reason"],utc_now(),order["lot_id"]))
+                remaining_notional = (Decimal(lot["entry_notional"]) * remaining / Decimal(lot["quantity"])
+                                      if remaining else Decimal(lot["entry_notional"]))
+                db.execute("UPDATE v2_lots SET quantity=?,entry_notional=?,status=?,exit_reason=?,closed_at=?,updated_at=? WHERE lot_id=?",
+                           (str(remaining),str(remaining_notional),"OPEN" if remaining else "CLOSED",
+                            None if remaining else order["reason"],
+                            executed_at.isoformat() if not remaining else None,utc_now(),order["lot_id"]))
                 if lot["strategy"] == "long" and order["reason"] == "HARD_STOP":
                     db.execute("INSERT OR IGNORE INTO v2_day_locks VALUES (?,?,'LONG_STOP',?)",
                                (executed_at.date().isoformat(),lot["symbol"],utc_now()))

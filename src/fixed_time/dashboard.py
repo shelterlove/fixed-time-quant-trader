@@ -52,10 +52,17 @@ def snapshot(database: Path) -> dict:
                 detail = json.loads(row["detail_json"])
             except (ValueError,TypeError):
                 detail = {}
+            candidate_rejections = sorted({x.get("rejection") for x in detail.get("candidates") or []
+                                           if isinstance(x, dict) and x.get("rejection")})
+            decision_reason = detail.get("reason")
+            if not decision_reason and detail.get("candidates") and not detail.get("plan"):
+                decision_reason = ", ".join(candidate_rejections) if candidate_rejections else "NO_CAPACITY"
             decisions.append({"decision_time":row["decision_time"],"status":row["status"],
                 "candidates":len(detail.get("candidates") or []),"planned":len(detail.get("plan") or []),
-                "outcomes":detail.get("admissions") or [],"reason":detail.get("reason")})
-        closed = [dict(x) for x in db.execute("SELECT symbol,strategy,source,entry_price,entry_time,updated_at,exit_reason FROM v2_lots WHERE status='CLOSED' ORDER BY updated_at DESC LIMIT 10")]
+                "outcomes":detail.get("admissions") or [],"reason":decision_reason})
+        lot_columns = {x[1] for x in db.execute("PRAGMA table_info(v2_lots)")}
+        exit_time = "COALESCE(closed_at,updated_at)" if "closed_at" in lot_columns else "updated_at"
+        closed = [dict(x) for x in db.execute(f"SELECT symbol,strategy,source,entry_price,entry_time,{exit_time} AS exit_time,exit_reason FROM v2_lots WHERE status='CLOSED' ORDER BY {exit_time} DESC LIMIT 10")]
         occupied = {side:str(sum((Decimal(x["entry_notional"]) for x in positions if x["strategy"] == side),Decimal())) for side in ("long","short")}
         change = str(Decimal(equity["equity"])-Decimal(first_equity["equity"])) if equity and first_equity else None
         reason = "运行正常" if alive and equity_fresh and not incidents else (

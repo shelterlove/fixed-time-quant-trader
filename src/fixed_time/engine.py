@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import signal
@@ -206,11 +206,79 @@ class Engine:
             self.store.block(f"UNCONFIRMED_EXIT:{lot['lot_id']}",
                              "exchange exposure is zero but exit fills are missing; keep ledger for reconciliation")
 
+    def _verified_adl_order(self, symbol: str, order_id: str, quantity: Decimal,
+                            position_side: str) -> dict | None:
+        side = "BUY" if position_side == "SHORT" else "SELL"
+        order = self.exchange.query_order_id(symbol, order_id)
+        trades = self.exchange.user_trades(symbol, order_id)
+        try:
+            valid = (str(order.get("orderId")) == order_id and order.get("status") == "FILLED"
+                and order.get("clientOrderId") == "adl_autoclose"
+                and order.get("symbol") == symbol and order.get("side") == side
+                and order.get("positionSide") == position_side
+                and Decimal(str(order.get("executedQty", "0"))) == quantity
+                and bool(trades)
+                and all(str(x.get("orderId")) == order_id and x.get("side") == side
+                        and x.get("positionSide") == position_side for x in trades)
+                and sum((Decimal(str(x.get("qty", "0"))) for x in trades), Decimal()) == quantity)
+        except (AttributeError, InvalidOperation, TypeError, ValueError):
+            valid = False
+        return order if valid else None
+
+    def _recover_forced_exit(self, lots: list[dict], observed: Decimal) -> bool:
+        # A forced close has no client ID from this engine. Attribute only an
+        # exact quantity gap belonging to one local lot.
+        if len(lots) != 1:
+            return False
+        lot = lots[0]
+        if any(x["lot_id"] == lot["lot_id"] for x in self.store.pending_orders()):
+            return False
+        symbol = str(lot["symbol"])
+        gap = Decimal(str(lot["quantity"])) - observed
+        if gap <= 0 or observed < 0:
+            return False
+        entry_ms = int(datetime.fromisoformat(str(lot["entry_time"])).timestamp() * 1000)
+        matches = []
+        for item in self.exchange.force_orders(symbol):
+            try:
+                if (item.get("clientOrderId") == "adl_autoclose"
+                    and item.get("symbol") == symbol
+                    and item.get("side") == self._side(str(lot["strategy"]), False)
+                    and item.get("positionSide") == lot["position_side"]
+                    and item.get("status") == "FILLED"
+                    and Decimal(str(item.get("executedQty", "0"))) == gap
+                    and int(item.get("updateTime") or item.get("time") or 0) >= entry_ms
+                    and item.get("orderId") is not None
+                    and not self.store.order(f"force:{symbol}:{item['orderId']}")):
+                    matches.append(item)
+            except (AttributeError, InvalidOperation, TypeError, ValueError):
+                continue
+        if len(matches) != 1:
+            return False
+        order_id = str(matches[0]["orderId"])
+        order = self._verified_adl_order(symbol, order_id, gap, str(lot["position_side"]))
+        if order is None:
+            return False
+        client = f"force:{symbol}:{order_id}"
+        self.store.begin_order({"client_id": client, "lot_id": lot["lot_id"], "role": "EXIT",
+                                "symbol": symbol, "side": order["side"], "position_side": lot["position_side"],
+                                "requested_quantity": gap, "reason": "EXCHANGE_ADL"})
+        self.store.apply_order(client, order, self.now())
+        self.store.event("WARN", "EXCHANGE_ADL", f"{symbol} {lot['position_side']}: order {order_id}, quantity {gap}")
+        return True
+
     def _recover_pending(self) -> None:
         for order in self.store.pending_orders():
             try:
-                response = (self.exchange.query_order_id(str(order["symbol"]), str(order["exchange_order_id"]))
-                            if order.get("exchange_order_id") else self.exchange.query_order(str(order["symbol"]), str(order["client_id"])))
+                if order["role"] == "EXIT" and order["reason"] == "EXCHANGE_ADL":
+                    order_id = str(order["client_id"]).rsplit(":", 1)[-1]
+                    response = self._verified_adl_order(str(order["symbol"]), order_id,
+                        Decimal(str(order["requested_quantity"])), str(order["position_side"]))
+                    if response is None:
+                        raise StateError(f"ADL receipt cannot be verified: {order['client_id']}")
+                else:
+                    response = (self.exchange.query_order_id(str(order["symbol"]), str(order["exchange_order_id"]))
+                                if order.get("exchange_order_id") else self.exchange.query_order(str(order["symbol"]), str(order["client_id"])))
             except ExchangeError as exc:
                 if exc.not_found and self.now() - datetime.fromisoformat(str(order["created_at"])) > timedelta(minutes=2):
                     if Decimal(order["applied_quantity"]) > 0:
@@ -269,6 +337,10 @@ class Engine:
                     self._algo_fill(lot, "cap_algo_id", "PROFIT_CAP400")
                 fresh = [x for x in self.store.open_lots() if (x["symbol"], x["position_side"]) == key]
                 expected = sum((Decimal(str(x["quantity"])) for x in fresh), Decimal())
+                if 0 <= observed < expected:
+                    self._recover_forced_exit(fresh, observed)
+                    fresh = [x for x in self.store.open_lots() if (x["symbol"], x["position_side"]) == key]
+                    expected = sum((Decimal(str(x["quantity"])) for x in fresh), Decimal())
                 if observed == 0 and expected > 0:
                     self._assume_exchange_flat(fresh)
                 if observed != expected:
@@ -311,6 +383,8 @@ class Engine:
                                                or (cap and Decimal(cap["quantity"]) != Decimal(lot["quantity"]))):
                 self._place_cap(lot)
             self.store.set_protection_version(str(lot["lot_id"]))
+        # Protection may have been replaced after a partial ADL fill.
+        open_algos = self.exchange.open_algos()
         tracked = {str(x[field]) for x in self.store.open_lots() for field in ("stop_algo_id", "cap_algo_id") if x.get(field)}
         unknown_algos = []
         for order in open_algos:

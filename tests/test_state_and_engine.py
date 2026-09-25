@@ -28,6 +28,7 @@ class FlatExchange:
     def positions(self): return []
     def open_algos(self): return []
     def open_orders(self): return []
+    def force_orders(self, symbol): return []
     def cancel_algo(self, *args): pass
     def cancel_order(self, *args): pass
     def query_algo_id(self, *args): return {"actualOrderId": "0"}
