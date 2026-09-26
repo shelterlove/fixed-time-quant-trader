@@ -30,6 +30,8 @@ sh deploy.sh
 
 ## 常用命令
 
+持仓手动操作启用时，在 VPS 的 `.env` 中设置至少 32 位随机 `DASHBOARD_CONTROL_TOKEN`（例如 `openssl rand -hex 32` 的输出），再运行 `sh deploy.sh`。面板只在 HTTPS 或本地 SSH 隧道中显示“提前卖出/平仓”和“延长持有 4h”；操作口令仅留在当前页面内存。指令写入账本队列，trader 复核交易所持仓后执行。提前平仓针对所选批次全部剩余数量；手动延长每批次仅一次，从当前计划退出时间增加 4 小时，不取消止损或止盈保护。页面的“指令已入队”表示等待执行，应继续查看持仓状态及最近退出。若 trader 停止，排队指令会在重启后重新核对；过期延长会被拒绝。
+
 ```bash
 python -m fixed_time.cli strategy-check --root .
 python -m fixed_time.cli live-check --root .
@@ -45,6 +47,8 @@ docker compose logs -f trader
 面板默认只绑定 VPS 的 `127.0.0.1:8080`。本地可用 `ssh -L 8080:127.0.0.1:8080 用户@VPS` 后访问；已有反向代理可继续连接该端口。
 
 ## 事故口径
+
+`SIGNALS` 出现 `Temporary failure in name resolution` 时，先检查 VPS 宿主机和 trader 容器对 `fapi.binance.com`、`demo-fapi.binance.com` 的解析，再在容器中访问两个 `/fapi/v1/time` 接口。新版错误会写明失败主机；宿主机成功而容器失败时检查 Docker DNS。恢复后用 `live-check` 核对账户和保护单，并确认事件已解除。错过 180 秒截止线的决策不补开仓。
 
 - `UNKNOWN_EXCHANGE_POSITION`：交易所有本地无法解释的方向仓位；禁止新开仓。
 - `POSITION_QUANTITY_MISMATCH`：交易所方向总量与各 lot 合计不同；禁止新开仓。

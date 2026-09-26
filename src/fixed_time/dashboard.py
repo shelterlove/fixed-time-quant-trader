@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import hmac
 import json
 from pathlib import Path
 import sqlite3
@@ -11,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 from .config import TESTNET_FUTURES_URL
+from .manual import ManualActionError, submit_action
 
 
 PERIODS = {"1d": (timedelta(days=1), 60), "7d": (timedelta(days=7), 600),
@@ -162,6 +164,11 @@ def snapshot(database: Path, period: str = "1d") -> dict:
         if "v2_lots" not in tables:
             return {"healthy": False, "reason": "v2 schema not initialized", "positions": [], "incidents": []}
         positions = [dict(x) for x in db.execute("SELECT * FROM v2_lots WHERE status='OPEN' ORDER BY opened_at")]
+        if "v2_manual_actions" in tables:
+            actions = {x["lot_id"]: dict(x) for x in db.execute("""SELECT a.* FROM v2_manual_actions a
+                WHERE a.requested_at=(SELECT MAX(b.requested_at) FROM v2_manual_actions b WHERE b.lot_id=a.lot_id)""")}
+            for position in positions:
+                position["manual_action"] = actions.get(position["lot_id"])
         algo_records = {str(x["algo_id"]):dict(x) for x in db.execute("SELECT * FROM v2_algos WHERE algo_id IS NOT NULL")} if "v2_algos" in tables else {}
         for position in positions:
             stop = algo_records.get(str(position.get("stop_algo_id")))
@@ -208,9 +215,11 @@ def snapshot(database: Path, period: str = "1d") -> dict:
         db.close()
 
 
-def serve(database: Path, host: str, port: int) -> None:
+def serve(database: Path, host: str, port: int, control_token: str | None = None) -> None:
     from urllib.parse import parse_qs, urlsplit
 
+    if control_token and len(control_token) < 32:
+        raise ValueError("DASHBOARD_CONTROL_TOKEN must have at least 32 characters")
     quotes = TickerCache()
 
     class Handler(BaseHTTPRequestHandler):
@@ -224,6 +233,7 @@ def serve(database: Path, host: str, port: int) -> None:
                 data = snapshot(database, period)
                 if url.path == "/api/status":
                     data["quotes"] = quotes.get({x["symbol"] for x in data.get("positions", [])})
+                    data["controls_enabled"] = bool(control_token)
                 body = json.dumps(data, default=str).encode()
                 # HTTP health is dashboard liveness; trading health is explicit
                 # in the payload and live-health command, so incidents stay visible.
@@ -236,6 +246,50 @@ def serve(database: Path, host: str, port: int) -> None:
             else:
                 self.send_error(404)
                 return
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if self.path != "/api/manual-action":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if not 0 < length <= 2048:
+                self.send_error(400, "invalid request size")
+                return
+            body_bytes = self.rfile.read(length)
+            origin = self.headers.get("Origin", "")
+            parsed = urlsplit(origin)
+            if (not control_token or not origin or parsed.netloc != self.headers.get("Host") or
+                    (parsed.scheme != "https" and not (parsed.scheme == "http" and
+                    parsed.hostname in {"localhost", "127.0.0.1", "::1"}))):
+                self.send_error(403, "manual controls require HTTPS or a local SSH tunnel")
+                return
+            if not hmac.compare_digest(self.headers.get("X-Control-Token", ""), control_token):
+                self.send_error(403, "invalid control token")
+                return
+            try:
+                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                    raise ManualActionError("invalid request body")
+                payload = json.loads(body_bytes)
+                if not isinstance(payload, dict) or set(payload) != {"lot_id", "action", "expected_exit_time"}:
+                    raise ManualActionError("invalid request fields")
+                result = submit_action(database, **payload)
+                status = 202
+            except (ManualActionError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                result = {"error": str(exc)}
+                status = 409
+            except sqlite3.Error:
+                result = {"error": "ledger is temporarily unavailable"}
+                status = 503
+            body = json.dumps(result).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

@@ -31,12 +31,13 @@ services:
     environment:
       DATABASE_PATH: ${DATABASE_PATH:-/app/runtime/testnet.sqlite3}
       TRADING_ENABLED: "false"
+      DASHBOARD_CONTROL_TOKEN: ${DASHBOARD_CONTROL_TOKEN:-}
     restart: unless-stopped
     depends_on:
       trader:
         condition: service_started
     volumes:
-      - ./runtime:/app/runtime:ro
+      - ./runtime:/app/runtime
     ports:
       - "${DASHBOARD_BIND:-127.0.0.1}:8080:8080"
     healthcheck:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(status, default=str))
         return 0 if status["healthy"] else 1
     if args.command == "live-dashboard":
-        serve(config.database_path, args.host, args.port)
+        serve(config.database_path, args.host, args.port, os.environ.get("DASHBOARD_CONTROL_TOKEN"))
         return 0
     with RuntimeLock(config.database_path):
         engine = Engine(config)

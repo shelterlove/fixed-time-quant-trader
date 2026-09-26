@@ -9,9 +9,10 @@ import hmac
 import json
 from math import lcm
 import re
+from time import sleep
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 import polars as pl
@@ -48,7 +49,7 @@ def _transport(method: str, url: str, params: dict[str, str], headers: dict[str,
             code = None
         raise ExchangeError(f"HTTP {exc.code}: {body}", code) from exc
     except URLError as exc:
-        raise ExchangeError(f"network error: {exc.reason}") from exc
+        raise ExchangeError(f"network error contacting {urlsplit(url).hostname}: {exc.reason}") from exc
     except (OSError, HTTPException, ValueError) as exc:
         raise ExchangeError(f"incomplete exchange response: {exc}") from exc
 
@@ -100,7 +101,7 @@ class Binance:
         attempts = self.config.max_attempts if method == "GET" else 1
         timestamp_retry = signed
         last: ExchangeError | None = None
-        for _ in range(attempts + int(timestamp_retry)):
+        for attempt in range(attempts + int(timestamp_retry)):
             payload = dict(params or {})
             headers: dict[str, str] = {}
             if signed:
@@ -124,6 +125,8 @@ class Binance:
                     continue
                 if method != "GET":
                     raise
+                if attempt + 1 < attempts and exc.code is None:
+                    sleep(min(2 ** attempt, 4))
         raise last or ExchangeError("request failed")
 
     def _catalogue(self, base: str) -> dict:

@@ -133,6 +133,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS v2_deployments (
                     run_id TEXT PRIMARY KEY, version TEXT NOT NULL, started_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS v2_manual_actions (
+                    action_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL, action TEXT NOT NULL,
+                    expected_exit_time TEXT NOT NULL, status TEXT NOT NULL,
+                    requested_at TEXT NOT NULL, finished_at TEXT, detail TEXT
+                );
+                CREATE INDEX IF NOT EXISTS v2_manual_actions_pending ON v2_manual_actions(status, requested_at);
                 CREATE INDEX IF NOT EXISTS v2_lots_open ON v2_lots(status, symbol, position_side);
                 CREATE INDEX IF NOT EXISTS v2_orders_pending ON v2_orders(status);
                 CREATE INDEX IF NOT EXISTS v2_equity_time ON v2_equity(observed_at);
@@ -142,6 +148,8 @@ class Store:
                 db.execute("ALTER TABLE v2_lots ADD COLUMN protection_version TEXT")
             if "closed_at" not in columns:
                 db.execute("ALTER TABLE v2_lots ADD COLUMN closed_at TEXT")
+            if "manual_extended_at" not in columns:
+                db.execute("ALTER TABLE v2_lots ADD COLUMN manual_extended_at TEXT")
             order_columns = {row[1] for row in db.execute("PRAGMA table_info(v2_orders)")}
             if "applied_quantity" not in order_columns:
                 db.execute("ALTER TABLE v2_orders ADD COLUMN applied_quantity TEXT NOT NULL DEFAULT '0'")
@@ -227,6 +235,38 @@ class Store:
         with self.transaction() as db:
             db.execute("UPDATE v2_lots SET extended=1,scheduled_exit_time=?,updated_at=? WHERE lot_id=? AND status='OPEN'",
                        (scheduled.isoformat(), utc_now(), lot_id))
+
+    def pending_manual_actions(self) -> list[dict[str, Any]]:
+        return [dict(x) for x in self.connection.execute(
+            "SELECT * FROM v2_manual_actions WHERE status='PENDING' ORDER BY requested_at,action_id")]
+
+    def finish_manual_action(self, action_id: str, status: str, detail: str) -> None:
+        if status not in {"APPLIED", "REJECTED"}:
+            raise ValueError("invalid manual action status")
+        with self.transaction() as db:
+            db.execute("UPDATE v2_manual_actions SET status=?,finished_at=?,detail=? WHERE action_id=? AND status='PENDING'",
+                       (status, utc_now(), detail, action_id))
+
+    def apply_manual_extension(self, action: dict[str, Any], now: datetime) -> bool:
+        with self.transaction() as db:
+            row = db.execute("""UPDATE v2_lots SET scheduled_exit_time=?,manual_extended_at=?,updated_at=?
+                WHERE lot_id=? AND status='OPEN' AND exit_reason IS NULL AND manual_extended_at IS NULL
+                AND scheduled_exit_time=? AND scheduled_exit_time>?""",
+                ((datetime.fromisoformat(action["expected_exit_time"])+timedelta(hours=4)).isoformat(),
+                 now.isoformat(), now.isoformat(), action["lot_id"], action["expected_exit_time"], now.isoformat()))
+            if row.rowcount != 1:
+                return False
+            db.execute("UPDATE v2_manual_actions SET status='APPLIED',finished_at=?,detail=? WHERE action_id=? AND status='PENDING'",
+                       (now.isoformat(), "planned exit extended by four hours", action["action_id"]))
+            db.execute("INSERT INTO v2_events VALUES (?,?,?,?)",
+                       (now.isoformat(), "INFO", "MANUAL_EXTEND_4H", action["lot_id"]))
+            return True
+
+    def request_exit(self, lot_id: str, reason: str) -> None:
+        """Persist the intent before any exchange order so interrupted exits resume."""
+        with self.transaction() as db:
+            db.execute("UPDATE v2_lots SET exit_reason=COALESCE(exit_reason,?),updated_at=? WHERE lot_id=? AND status='OPEN'",
+                       (reason, utc_now(), lot_id))
 
     def begin_order(self, row: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()

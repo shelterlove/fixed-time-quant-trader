@@ -604,7 +604,46 @@ class Engine:
             except (ExchangeError,StateError,ValueError) as exc:
                 self.store.block(f"LOT:{lot['lot_id']}",str(exc))
 
+    def process_manual_actions(self, now: datetime | None = None) -> None:
+        now = (now or self.now()).astimezone(UTC)
+        for action in self.store.pending_manual_actions():
+            lot = self.store.lot(action["lot_id"])
+            if lot is None or lot["status"] != "OPEN":
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "position is closed")
+                continue
+            if action["action"] == "SELL_NOW" and lot.get("exit_reason") == "MANUAL_EXIT":
+                self.store.finish_manual_action(action["action_id"], "APPLIED", "exit already requested")
+                continue
+            if lot.get("exit_reason") or lot["scheduled_exit_time"] != action["expected_exit_time"]:
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed before execution")
+                continue
+            if action["action"] == "EXTEND_4H" and (lot.get("manual_extended_at") or
+                    datetime.fromisoformat(lot["scheduled_exit_time"]) <= now):
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "extension window expired")
+                continue
+            if action["action"] not in {"SELL_NOW", "EXTEND_4H"}:
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "unknown action")
+                continue
+            self.reconcile()
+            blocking = [x["code"] for x in self.store.incidents()
+                        if x["code"] not in {"SIGNALS", "EQUITY", "MANUAL_ACTION"}]
+            if blocking:
+                raise StateError(f"manual action waits for exchange reconciliation: {blocking}")
+            lot = self.store.lot(action["lot_id"])
+            if lot is None or lot["status"] != "OPEN" or lot.get("exit_reason"):
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed during reconciliation")
+                continue
+            if action["action"] == "SELL_NOW":
+                self.store.request_exit(action["lot_id"], "MANUAL_EXIT")
+                self.store.finish_manual_action(action["action_id"], "APPLIED", "manual exit requested")
+                self.store.event("INFO", "MANUAL_EXIT", action["lot_id"])
+            elif not self.store.apply_manual_extension(action, now):
+                self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed before extension")
+
     def _manage_lot(self, lot: dict, now: datetime, prices: dict) -> None:
+        if lot.get("exit_reason"):
+            self._close_lot(lot, str(lot["exit_reason"]))
+            return
         symbol = str(lot["symbol"])
         if symbol not in prices:
             prices[symbol] = self.exchange.latest_price(symbol)
@@ -635,11 +674,13 @@ class Engine:
             activation = datetime.fromisoformat(str(lot["first_extension_activation"]))
             planned = datetime.fromisoformat(str(lot["planned_exit_time"]))
             if planned - timedelta(hours=4) < activation <= planned:
-                self.store.extend(str(lot["lot_id"]), planned + timedelta(hours=24))
-                if now < planned + timedelta(hours=24):
+                auto_exit = scheduled + timedelta(hours=24)
+                self.store.extend(str(lot["lot_id"]), auto_exit)
+                if now < auto_exit:
                     return
                 lot["extended"] = 1
-        self._close_lot(lot, "EXTENSION_CAP" if lot.get("extended") else "PLANNED_EXIT")
+        self._close_lot(lot, "EXTENSION_CAP" if lot.get("extended") else
+                        "MANUAL_EXTENSION_CAP" if lot.get("manual_extended_at") else "PLANNED_EXIT")
 
     def _due_decision(self, now: datetime) -> datetime | None:
         decision = now.replace(minute=0, second=0, microsecond=0)
@@ -669,6 +710,7 @@ class Engine:
                 if self._last_reconcile is None or now - self._last_reconcile >= timedelta(seconds=self.config.reconcile_seconds):
                     stages.append(("RECONCILE",self.reconcile))
                     self._last_reconcile = now
+                stages.append(("MANUAL_ACTION",lambda: self.process_manual_actions(now)))
                 stages.append(("MANAGE",lambda: self.manage_positions(now)))
                 def sample_equity():
                     minute = now.replace(second=0, microsecond=0)
