@@ -6,7 +6,7 @@
 2. 保持 `TRADING_ENABLED=false`，执行 `docker compose build` 和 `docker compose run --rm --no-deps trader python -m fixed_time.cli live-check --root /app`。
 3. 确认账户为 Hedge Mode、Single-Asset Mode，且持仓使用 isolated 2x。
 4. 设置 `TRADING_ENABLED=true`，执行 `./deploy.sh`。
-5. `docker compose ps` 应显示 trader 和 dashboard healthy；面板位于 `http://127.0.0.1:8080`。
+5. `docker compose ps` 应显示 trader、dashboard 和 dashboard_https 运行正常；公网面板位于 `https://141-98-199-119.sslip.io:8444/`。
 
 `deploy.sh` 沿用现有 Docker Compose，记录 Git revision，构建并运行隔离测试，检查账户，停止旧 trader，通过 SQLite backup API 备份数据库，再更新容器并等待健康检查。测试与第一次预检失败时旧容器继续运行；停机后的预检或备份失败会尝试重启旧容器。
 
@@ -32,6 +32,8 @@ sh deploy.sh
 
 持仓手动操作启用时，在 VPS 的 `.env` 中设置至少 32 位随机 `DASHBOARD_CONTROL_TOKEN`（例如 `openssl rand -hex 32` 的输出），再运行 `sh deploy.sh`。面板只在 HTTPS 或本地 SSH 隧道中显示“提前卖出/平仓”和“延长持有 4h”；操作口令仅留在当前页面内存。指令写入账本队列，trader 复核交易所持仓后执行。提前平仓针对所选批次全部剩余数量；手动延长每批次仅一次，从当前计划退出时间增加 4 小时，不取消止损或止盈保护。页面的“指令已入队”表示等待执行，应继续查看持仓状态及最近退出。若 trader 停止，排队指令会在重启后重新核对；过期延长会被拒绝。
 
+公网面板地址为 `https://141-98-199-119.sslip.io:8444/`，使用 Caddy 自动签发和续期证书。HTTP 80 仅用于证书验证和跳转；8080 只绑定 VPS 本机。VPS 的 443 已由其他服务占用，因此面板使用 8444。交易操作仍需输入 `.env` 内的控制口令。
+
 ```bash
 python -m fixed_time.cli strategy-check --root .
 python -m fixed_time.cli live-check --root .
@@ -44,7 +46,7 @@ docker compose logs -f trader
 
 面板权益曲线可切换 1 天、7 天、近 30 天，`/api/status?period=1d|7d|30d` 按时段分桶返回采样点；区间变化包含出入金影响。当前持仓的“入场均价”来自成交账本，“信号参考价”来自生成候选时的价格，“当前价格”来自交易所测试网公开报价，约 10 秒缓存，报价不可用时显示空值。最近退出按退出订单计算估算毛收益，不含手续费和资金费；旧账本缺少成交时间或价格时会明确标示。
 
-面板默认只绑定 VPS 的 `127.0.0.1:8080`。本地可用 `ssh -L 8080:127.0.0.1:8080 用户@VPS` 后访问；已有反向代理可继续连接该端口。
+面板内部端口只绑定 VPS 的 `127.0.0.1:8080`，公网访问由 dashboard_https 转发。
 
 ## 事故口径
 

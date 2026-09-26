@@ -39,7 +39,7 @@ services:
     volumes:
       - ./runtime:/app/runtime
     ports:
-      - "${DASHBOARD_BIND:-127.0.0.1}:8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
       interval: 15s
