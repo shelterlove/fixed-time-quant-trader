@@ -1,3 +1,5 @@
 141-98-199-119.sslip.io:8444 {
-    reverse_proxy dashboard:8080
+    reverse_proxy dashboard:8080 {
+        header_up X-Client-IP {remote_host}
+    }
 }

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 from threading import Lock
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -221,6 +222,8 @@ def serve(database: Path, host: str, port: int, control_token: str | None = None
     if control_token and len(control_token) < 32:
         raise ValueError("DASHBOARD_CONTROL_TOKEN must have at least 32 characters")
     quotes = TickerCache()
+    auth_lock = Lock()
+    failed_auth: dict[str, list[float]] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -270,9 +273,24 @@ def serve(database: Path, host: str, port: int, control_token: str | None = None
                     parsed.hostname in {"localhost", "127.0.0.1", "::1"}))):
                 self.send_error(403, "manual controls require HTTPS or a local SSH tunnel")
                 return
+            client = self.headers.get("X-Client-IP") or self.client_address[0]
+            now = monotonic()
+            with auth_lock:
+                recent = [when for when in failed_auth.get(client, []) if now - when < 300]
+                if recent:
+                    failed_auth[client] = recent
+                else:
+                    failed_auth.pop(client, None)
+                if len(recent) >= 10:
+                    self.send_error(429, "too many incorrect passwords; retry in five minutes")
+                    return
             if not hmac.compare_digest(self.headers.get("X-Control-Token", ""), control_token):
-                self.send_error(403, "invalid control token")
+                with auth_lock:
+                    failed_auth.setdefault(client, []).append(now)
+                self.send_error(403, "invalid control password")
                 return
+            with auth_lock:
+                failed_auth.pop(client, None)
             try:
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                     raise ManualActionError("invalid request body")

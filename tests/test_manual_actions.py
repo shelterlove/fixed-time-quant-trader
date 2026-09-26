@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
+from hashlib import sha256
 from threading import Event, Thread
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -100,7 +101,7 @@ def test_dashboard_requires_token_and_secure_origin_for_manual_action(tmp_path, 
             server["instance"] = self
             ready.set()
     monkeypatch.setattr(dashboard, "ThreadingHTTPServer", LocalServer)
-    token = "a" * 64
+    token = sha256(b"zjr123321").hexdigest()
     worker = Thread(target=dashboard.serve, args=(tmp_path / "state.db", "127.0.0.1", 0, token), daemon=True)
     worker.start()
     assert ready.wait(3)
@@ -122,6 +123,13 @@ def test_dashboard_requires_token_and_secure_origin_for_manual_action(tmp_path, 
         with request(f"http://127.0.0.1:{port}", token) as response:
             assert response.status == 202
         assert len(store.pending_manual_actions()) == 1
+        for _ in range(10):
+            with pytest.raises(HTTPError) as incorrect:
+                request(f"http://127.0.0.1:{port}", "wrong")
+            assert incorrect.value.code == 403
+        with pytest.raises(HTTPError) as limited:
+            request(f"http://127.0.0.1:{port}", "wrong")
+        assert limited.value.code == 429
     finally:
         server["instance"].shutdown()
         server["instance"].server_close()
