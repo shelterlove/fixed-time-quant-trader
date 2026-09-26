@@ -50,3 +50,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  dashboard_https:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "8444:8444"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
