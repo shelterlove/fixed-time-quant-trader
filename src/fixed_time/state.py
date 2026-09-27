@@ -150,6 +150,15 @@ class Store:
                 db.execute("ALTER TABLE v2_lots ADD COLUMN closed_at TEXT")
             if "manual_extended_at" not in columns:
                 db.execute("ALTER TABLE v2_lots ADD COLUMN manual_extended_at TEXT")
+            for name, kind in (("manual_extension_hours", "INTEGER"), ("manual_stop_price", "TEXT"),
+                               ("manual_take_profit_price", "TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE v2_lots ADD COLUMN {name} {kind}")
+            action_columns = {row[1] for row in db.execute("PRAGMA table_info(v2_manual_actions)")}
+            for name, kind in (("extension_hours", "INTEGER"), ("stop_loss_price", "TEXT"),
+                               ("take_profit_price", "TEXT")):
+                if name not in action_columns:
+                    db.execute(f"ALTER TABLE v2_manual_actions ADD COLUMN {name} {kind}")
             order_columns = {row[1] for row in db.execute("PRAGMA table_info(v2_orders)")}
             if "applied_quantity" not in order_columns:
                 db.execute("ALTER TABLE v2_orders ADD COLUMN applied_quantity TEXT NOT NULL DEFAULT '0'")
@@ -249,18 +258,37 @@ class Store:
 
     def apply_manual_extension(self, action: dict[str, Any], now: datetime) -> bool:
         with self.transaction() as db:
-            row = db.execute("""UPDATE v2_lots SET scheduled_exit_time=?,manual_extended_at=?,updated_at=?
+            hours = int(action.get("extension_hours") or 4)
+            row = db.execute("""UPDATE v2_lots SET scheduled_exit_time=?,manual_extended_at=?,
+                manual_extension_hours=?,manual_stop_price=?,manual_take_profit_price=?,updated_at=?
                 WHERE lot_id=? AND status='OPEN' AND exit_reason IS NULL AND manual_extended_at IS NULL
                 AND scheduled_exit_time=? AND scheduled_exit_time>?""",
-                ((datetime.fromisoformat(action["expected_exit_time"])+timedelta(hours=4)).isoformat(),
-                 now.isoformat(), now.isoformat(), action["lot_id"], action["expected_exit_time"], now.isoformat()))
+                ((datetime.fromisoformat(action["expected_exit_time"])+timedelta(hours=hours)).isoformat(),
+                 now.isoformat(), hours, action.get("stop_loss_price"), action.get("take_profit_price"),
+                 now.isoformat(), action["lot_id"], action["expected_exit_time"], now.isoformat()))
             if row.rowcount != 1:
                 return False
             db.execute("UPDATE v2_manual_actions SET status='APPLIED',finished_at=?,detail=? WHERE action_id=? AND status='PENDING'",
-                       (now.isoformat(), "planned exit extended by four hours", action["action_id"]))
+                       (now.isoformat(), f"planned exit extended by {hours} hours", action["action_id"]))
             db.execute("INSERT INTO v2_events VALUES (?,?,?,?)",
-                       (now.isoformat(), "INFO", "MANUAL_EXTEND_4H", action["lot_id"]))
+                       (now.isoformat(), "INFO", "MANUAL_EXTEND", action["lot_id"]))
             return True
+
+    def unpriced_exit_orders(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("""SELECT client_id,symbol,side,position_side,
+            exchange_order_id,applied_quantity FROM v2_orders WHERE role='EXIT'
+            AND CAST(applied_quantity AS REAL)>0 AND CAST(average_price AS REAL)<=0
+            AND exchange_order_id IS NOT NULL AND exchange_order_id NOT IN ('','None')
+            ORDER BY updated_at DESC LIMIT ?""", (limit,))]
+
+    def set_exit_price(self, client_id: str, price: Decimal, quantity: Decimal) -> bool:
+        if not price.is_finite() or price <= 0:
+            raise StateError("invalid exit fill price")
+        with self.transaction() as db:
+            row = db.execute("""UPDATE v2_orders SET average_price=? WHERE client_id=? AND role='EXIT'
+                AND CAST(average_price AS REAL)<=0 AND applied_quantity=?""",
+                (format(price, "f"), client_id, str(quantity)))
+            return row.rowcount == 1
 
     def request_exit(self, lot_id: str, reason: str) -> None:
         """Persist the intent before any exchange order so interrupted exits resume."""
@@ -297,6 +325,9 @@ class Store:
                 raise StateError(f"nonmonotonic fill: {client_id}")
             delta = filled - applied
             average = Decimal(str(response.get("avgPrice", "0")))
+            if average <= 0 and filled > 0:
+                quote = Decimal(str(response.get("cumQuote", "0")))
+                average = quote / filled if quote > 0 else Decimal(str(order["average_price"]))
             status = str(response.get("status", "UNKNOWN"))
             timestamp = response.get("updateTime") or response.get("transactTime")
             executed_at = datetime.fromtimestamp(int(timestamp) / 1000, UTC) if timestamp else when

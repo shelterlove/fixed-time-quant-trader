@@ -26,6 +26,7 @@ class Engine:
         self.stop_requested = Event()
         self.run_id = uuid4().hex
         self._last_reconcile: datetime | None = None
+        self._last_exit_backfill: datetime | None = None
         self._last_equity_minute: datetime | None = None
 
     def close(self) -> None:
@@ -80,7 +81,7 @@ class Engine:
         for field in ("cap_algo_id",) if keep_stop else ("stop_algo_id", "cap_algo_id"):
             if lot.get(field):
                 self.exchange.cancel_algo(str(lot["symbol"]), str(lot[field]))
-                reason = "PROFIT_CAP400" if field == "cap_algo_id" else ("PROFIT_FLOOR270" if lot.get("profit_armed_at") else "HARD_STOP")
+                reason = self._cap_reason(lot) if field == "cap_algo_id" else self._stop_reason(lot)
                 self._algo_fill(lot, field, reason)
                 response = self.exchange.query_algo_id(str(lot["symbol"]), str(lot[field]))
                 if response.get("algoStatus") not in {"CANCELED", "EXPIRED", "REJECTED", "FINISHED"}:
@@ -93,22 +94,25 @@ class Engine:
     def _trigger(self, lot: dict, kind: str) -> Decimal:
         reference = Decimal(str(lot["entry_reference"]))
         rules = self.config.strategy.values
+        close_side = self._side(str(lot["strategy"]), False)
         if kind == "cap":
-            raw = reference * (Decimal(1) + Decimal(str(rules["long"]["profit_guard"]["cap_return"])))
-            side = "SELL"
+            custom = lot.get("manual_take_profit_price")
+            raw = (Decimal(str(custom)) if custom else
+                   reference * (Decimal(1) + Decimal(str(rules["long"]["profit_guard"]["cap_return"]))))
         elif lot["strategy"] == "long":
+            custom = lot.get("manual_stop_price")
             loss = (Decimal(str(rules["long"]["profit_guard"]["floor_return"]))
                     if lot.get("profit_armed_at") else Decimal(str(rules["long"]["hard_stop_return"])))
-            raw = reference * (Decimal(1) + loss)
-            side = "SELL"
+            raw = Decimal(str(custom)) if custom else reference * (Decimal(1) + loss)
         else:
-            raw = reference * (Decimal(1) + Decimal(str(rules["short"]["hard_stop_return"])))
-            side = "BUY"
-        return protective_price(raw, self.exchange.symbol_filters(str(lot["symbol"]))["tick_size"], side)
+            custom = lot.get("manual_stop_price")
+            raw = (Decimal(str(custom)) if custom else
+                   reference * (Decimal(1) + Decimal(str(rules["short"]["hard_stop_return"]))))
+        return protective_price(raw, self.exchange.symbol_filters(str(lot["symbol"]))["tick_size"], close_side)
 
     def _place_stop(self, lot: dict, *, replace: bool = False) -> str:
         old = str(lot.get("stop_algo_id") or "")
-        role = "f" if lot.get("profit_armed_at") else "s"
+        role = "m" if lot.get("manual_stop_price") else "f" if lot.get("profit_armed_at") else "s"
         if old:
             self.exchange.cancel_algo(str(lot["symbol"]), old)
             self._algo_fill(lot, "stop_algo_id", self._stop_reason(lot))
@@ -132,7 +136,7 @@ class Engine:
         old = lot.get("cap_algo_id")
         if old:
             self.exchange.cancel_algo(str(lot["symbol"]),str(old))
-            self._algo_fill(lot,"cap_algo_id","PROFIT_CAP400")
+            self._algo_fill(lot,"cap_algo_id",self._cap_reason(lot))
             response = self.exchange.query_algo_id(str(lot["symbol"]),str(old))
             if response.get("algoStatus") not in {"CANCELED","EXPIRED","REJECTED","FINISHED"}:
                 raise StateError(f"old cap unresolved: {old}")
@@ -143,7 +147,7 @@ class Engine:
             if any(x["lot_id"] == lot["lot_id"] for x in self.store.pending_orders()):
                 raise StateError(f"cap fill still pending: {lot['lot_id']}")
         sequence = len(self.store.algos(str(lot["lot_id"])))
-        result = self._conditional(lot, "SELL", self._trigger(lot, "cap"), "TAKE_PROFIT_MARKET",
+        result = self._conditional(lot, self._side(str(lot["strategy"]), False), self._trigger(lot, "cap"), "TAKE_PROFIT_MARKET",
                                    self.client_id("c", str(lot["lot_id"]), sequence))
         algo_id = str(result["algoId"])
         self.store.set_algos(str(lot["lot_id"]), cap=algo_id)
@@ -172,8 +176,16 @@ class Engine:
     def _stop_reason(self, lot: dict) -> str:
         records = [x for x in self.store.algos(str(lot["lot_id"])) if x["algo_id"] == lot.get("stop_algo_id")]
         if records:
+            if lot.get("manual_stop_price") and Decimal(records[-1]["trigger_price"]) == self._trigger(lot, "stop"):
+                return "MANUAL_STOP"
             return "PROFIT_FLOOR270" if Decimal(records[-1]["trigger_price"]) > Decimal(lot["entry_reference"]) and lot["strategy"] == "long" else "HARD_STOP"
-        return "PROFIT_FLOOR270" if lot.get("profit_armed_at") else "HARD_STOP"
+        return "MANUAL_STOP" if lot.get("manual_stop_price") else "PROFIT_FLOOR270" if lot.get("profit_armed_at") else "HARD_STOP"
+
+    def _cap_reason(self, lot: dict) -> str:
+        records = [x for x in self.store.algos(str(lot["lot_id"])) if x["algo_id"] == lot.get("cap_algo_id")]
+        if lot.get("manual_take_profit_price") and (not records or Decimal(records[-1]["trigger_price"]) == self._trigger(lot, "cap")):
+            return "MANUAL_TAKE_PROFIT"
+        return "PROFIT_CAP400"
 
     def _algo_fill(self, lot: dict, field: str, reason: str) -> bool:
         algo_id = lot.get(field)
@@ -310,13 +322,14 @@ class Engine:
                 self.store.set_algos(order["lot_id"], **{order["kind"]:str(result["algoId"])})
             elif unbound:
                 self._algo_fill(dict(lot,**{field:str(result["algoId"])}),field,
-                                "PROFIT_CAP400" if order["kind"] == "cap" else self._stop_reason(dict(lot,stop_algo_id=str(result["algoId"]))))
+                                self._cap_reason(dict(lot,cap_algo_id=str(result["algoId"]))) if order["kind"] == "cap"
+                                else self._stop_reason(dict(lot,stop_algo_id=str(result["algoId"]))))
 
     def reconcile(self) -> bool:
         self._recover_pending()
         for lot in self.store.open_lots():
             self._algo_fill(lot, "stop_algo_id", self._stop_reason(lot))
-            self._algo_fill(lot, "cap_algo_id", "PROFIT_CAP400")
+            self._algo_fill(lot, "cap_algo_id", self._cap_reason(lot))
         exchange_positions = self._position_map(self.exchange.positions())
         lots = self.store.open_lots()
         groups = self._lot_groups(lots)
@@ -334,7 +347,7 @@ class Engine:
                 for lot in group:
                     stop_reason = self._stop_reason(lot)
                     self._algo_fill(lot, "stop_algo_id", stop_reason)
-                    self._algo_fill(lot, "cap_algo_id", "PROFIT_CAP400")
+                    self._algo_fill(lot, "cap_algo_id", self._cap_reason(lot))
                 fresh = [x for x in self.store.open_lots() if (x["symbol"], x["position_side"]) == key]
                 expected = sum((Decimal(str(x["quantity"])) for x in fresh), Decimal())
                 if 0 <= observed < expected:
@@ -379,8 +392,10 @@ class Engine:
             if lot["status"] != "OPEN":
                 continue
             cap = next((x for x in records if x["algo_id"] == lot.get("cap_algo_id")),None)
-            if lot["strategy"] == "long" and (not lot.get("cap_algo_id") or str(lot["cap_algo_id"]) not in open_algo_ids
-                                               or (cap and Decimal(cap["quantity"]) != Decimal(lot["quantity"]))):
+            if (lot["strategy"] == "long" or lot.get("manual_take_profit_price")) and (
+                not lot.get("cap_algo_id") or str(lot["cap_algo_id"]) not in open_algo_ids
+                or (cap and (Decimal(cap["quantity"]) != Decimal(lot["quantity"])
+                             or Decimal(cap["trigger_price"]) != self._trigger(lot, "cap")))):
                 self._place_cap(lot)
             self.store.set_protection_version(str(lot["lot_id"]))
         # Protection may have been replaced after a partial ADL fill.
@@ -419,7 +434,31 @@ class Engine:
                 lot = self.store.lot(incident["code"][4:])
                 if lot and lot["status"] == "CLOSED":
                     self.store.resolve(incident["code"])
+        self.backfill_exit_prices()
         return not self.store.blocked()
+
+    def backfill_exit_prices(self, *, force: bool = False) -> int:
+        now = self.now()
+        if not force and self._last_exit_backfill and now - self._last_exit_backfill < timedelta(minutes=1):
+            return 0
+        self._last_exit_backfill = now
+        updated = 0
+        for order in self.store.unpriced_exit_orders(10 if force else 3):
+            try:
+                trades = self.exchange.user_trades(str(order["symbol"]), str(order["exchange_order_id"]))
+                matched = [trade for trade in trades if str(trade.get("orderId")) == str(order["exchange_order_id"])
+                           and trade.get("side") == order["side"]
+                           and trade.get("positionSide") == order["position_side"]]
+                quantity = sum((Decimal(str(trade["qty"])) for trade in matched), Decimal())
+                expected = Decimal(str(order["applied_quantity"]))
+                if quantity != expected or quantity <= 0:
+                    continue
+                value = sum((Decimal(str(trade["qty"])) * Decimal(str(trade["price"])) for trade in matched), Decimal())
+                if self.store.set_exit_price(str(order["client_id"]), value / quantity, expected):
+                    updated += 1
+            except (ExchangeError, KeyError, InvalidOperation, TypeError, ValueError):
+                continue  # Missing trade detail affects display only; try again later.
+        return updated
 
     def _eligible(self, rows: list[dict], tradable: set[str], now: datetime) -> list[dict]:
         lots = self.store.open_lots()
@@ -617,11 +656,12 @@ class Engine:
             if lot.get("exit_reason") or lot["scheduled_exit_time"] != action["expected_exit_time"]:
                 self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed before execution")
                 continue
-            if action["action"] == "EXTEND_4H" and (lot.get("manual_extended_at") or
+            extending = action["action"] in {"EXTEND", "EXTEND_4H"}
+            if extending and (lot.get("manual_extended_at") or
                     datetime.fromisoformat(lot["scheduled_exit_time"]) <= now):
                 self.store.finish_manual_action(action["action_id"], "REJECTED", "extension window expired")
                 continue
-            if action["action"] not in {"SELL_NOW", "EXTEND_4H"}:
+            if action["action"] not in {"SELL_NOW", "EXTEND", "EXTEND_4H"}:
                 self.store.finish_manual_action(action["action_id"], "REJECTED", "unknown action")
                 continue
             self.reconcile()
@@ -637,8 +677,22 @@ class Engine:
                 self.store.request_exit(action["lot_id"], "MANUAL_EXIT")
                 self.store.finish_manual_action(action["action_id"], "APPLIED", "manual exit requested")
                 self.store.event("INFO", "MANUAL_EXIT", action["lot_id"])
-            elif not self.store.apply_manual_extension(action, now):
-                self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed before extension")
+            else:
+                if action.get("stop_loss_price") or action.get("take_profit_price"):
+                    price = self.exchange.latest_price(str(lot["symbol"]))
+                    proposed = dict(lot, manual_stop_price=action.get("stop_loss_price"),
+                                    manual_take_profit_price=action.get("take_profit_price"))
+                    stop = self._trigger(proposed, "stop")
+                    take_profit = self._trigger(proposed, "cap") if lot["strategy"] == "long" or action.get("take_profit_price") else None
+                    valid = ((stop < price and (take_profit is None or price < take_profit))
+                             if lot["strategy"] == "long" else
+                             (stop > price and (take_profit is None or price > take_profit)))
+                    if not valid:
+                        self.store.finish_manual_action(action["action_id"], "REJECTED",
+                                                        "stop/take-profit must be on the correct side of the current price")
+                        continue
+                if not self.store.apply_manual_extension(action, now):
+                    self.store.finish_manual_action(action["action_id"], "REJECTED", "position changed before extension")
 
     def _manage_lot(self, lot: dict, now: datetime, prices: dict) -> None:
         if lot.get("exit_reason"):
@@ -651,8 +705,14 @@ class Engine:
         reference = Decimal(str(lot["entry_reference"]))
         stop = self._trigger(lot,"stop")
         if (lot["strategy"] == "long" and price <= stop) or (lot["strategy"] == "short" and price >= stop):
-            self._close_lot(lot, "PROFIT_FLOOR270" if lot.get("profit_armed_at") else "HARD_STOP")
+            self._close_lot(lot, "MANUAL_STOP" if lot.get("manual_stop_price") else
+                            "PROFIT_FLOOR270" if lot.get("profit_armed_at") else "HARD_STOP")
             return
+        if lot.get("manual_take_profit_price"):
+            take_profit = self._trigger(lot, "cap")
+            if (lot["strategy"] == "long" and price >= take_profit) or (lot["strategy"] == "short" and price <= take_profit):
+                self._close_lot(lot, "MANUAL_TAKE_PROFIT")
+                return
         if lot["strategy"] == "long":
             if not lot.get("first_extension_activation") and price >= reference * Decimal("1.3"):
                 self.store.arm_extension(str(lot["lot_id"]), now)
@@ -660,11 +720,12 @@ class Engine:
             if not lot.get("profit_armed_at") and price >= reference * Decimal("4"):
                 self.store.arm_profit(str(lot["lot_id"]), now)
                 lot["profit_armed_at"] = now.isoformat()
-                self._place_stop(lot, replace=True)
+                if not lot.get("manual_stop_price"):
+                    self._place_stop(lot, replace=True)
                 lot = self.store.lot(str(lot["lot_id"])) or lot
                 if lot["status"] != "OPEN":
                     return
-            if price >= reference * Decimal("5"):
+            if not lot.get("manual_take_profit_price") and price >= reference * Decimal("5"):
                 self._close_lot(lot, "PROFIT_CAP400")
                 return
         scheduled = datetime.fromisoformat(str(lot["scheduled_exit_time"]))

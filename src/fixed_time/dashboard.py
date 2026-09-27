@@ -173,7 +173,9 @@ def snapshot(database: Path, period: str = "1d") -> dict:
         algo_records = {str(x["algo_id"]):dict(x) for x in db.execute("SELECT * FROM v2_algos WHERE algo_id IS NOT NULL")} if "v2_algos" in tables else {}
         for position in positions:
             stop = algo_records.get(str(position.get("stop_algo_id")))
+            take_profit = algo_records.get(str(position.get("cap_algo_id")))
             position["stop_trigger"] = stop["trigger_price"] if stop else None
+            position["take_profit_trigger"] = take_profit["trigger_price"] if take_profit else None
             position["stop_is_floor"] = bool(stop and position["strategy"] == "long"
                                              and Decimal(stop["trigger_price"]) > Decimal(position["entry_reference"]))
         incidents = [dict(x) for x in db.execute("SELECT * FROM v2_incidents WHERE resolved_at IS NULL ORDER BY first_seen")]
@@ -295,7 +297,9 @@ def serve(database: Path, host: str, port: int, control_token: str | None = None
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                     raise ManualActionError("invalid request body")
                 payload = json.loads(body_bytes)
-                if not isinstance(payload, dict) or set(payload) != {"lot_id", "action", "expected_exit_time"}:
+                required = {"lot_id", "action", "expected_exit_time"}
+                optional = {"extension_hours", "stop_loss_price", "take_profit_price"}
+                if not isinstance(payload, dict) or not required <= set(payload) or set(payload) - required - optional:
                     raise ManualActionError("invalid request fields")
                 result = submit_action(database, **payload)
                 status = 202

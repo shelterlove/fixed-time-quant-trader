@@ -54,6 +54,84 @@ def test_manual_extension_is_one_time_and_preserves_automatic_extension(tmp_path
     engine.close()
 
 
+@pytest.mark.parametrize("strategy,stop,take,stop_side,cap_side", [
+    ("long", "95.01", "120.01", "SELL", "SELL"),
+    ("short", "110.09", "90.09", "BUY", "BUY"),
+])
+def test_custom_extension_sets_exchange_stop_and_take_profit(tmp_path, strategy, stop, take, stop_side, cap_side):
+    store, scheduled = future_lot(tmp_path, strategy)
+    submit_action(tmp_path / "state.db", lot_id="lot", action="EXTEND", expected_exit_time=scheduled,
+                  extension_hours=6, stop_loss_price=stop, take_profit_price=take)
+    exchange = FlatExchange()
+    exchange.positions = lambda: [{"symbol": "ABCUSDT", "positionSide": strategy.upper(),
+                                    "positionAmt": "2" if strategy == "long" else "-2"}]
+    placed = []
+    exchange.conditional_order = lambda *args, **kwargs: placed.append(args) or {"algoId": f"algo{len(placed)}"}
+    engine = Engine(live_config(tmp_path), exchange, store)
+    engine.reconcile = lambda: True
+    engine.process_manual_actions()
+    lot = store.lot("lot")
+    assert lot["scheduled_exit_time"] == (datetime.fromisoformat(scheduled)+timedelta(hours=6)).isoformat()
+    assert lot["manual_extension_hours"] == 6
+    assert lot["manual_stop_price"] == stop
+    assert lot["manual_take_profit_price"] == take
+    engine.reconcile = Engine.reconcile.__get__(engine)
+    assert engine.reconcile()
+    assert [(call[1], call[4], call[5]) for call in placed] == [
+        (stop_side, engine._trigger(lot, "stop"), "STOP_MARKET"),
+        (cap_side, engine._trigger(lot, "cap"), "TAKE_PROFIT_MARKET"),
+    ]
+    assert snapshot(tmp_path / "state.db")["positions"][0]["take_profit_trigger"] is not None
+    engine.close()
+
+
+def test_custom_extension_rejects_triggered_price_without_extending(tmp_path):
+    store, scheduled = future_lot(tmp_path)
+    submit_action(tmp_path / "state.db", lot_id="lot", action="EXTEND", expected_exit_time=scheduled,
+                  stop_loss_price="105")
+    engine = Engine(live_config(tmp_path), FlatExchange(), store)
+    engine.reconcile = lambda: True
+    engine.process_manual_actions()
+    assert store.lot("lot")["scheduled_exit_time"] == scheduled
+    assert store.lot("lot")["manual_extended_at"] is None
+    assert store.connection.execute("SELECT status FROM v2_manual_actions").fetchone()[0] == "REJECTED"
+    engine.close()
+
+
+def test_custom_take_profit_supersedes_default_profit_cap(tmp_path):
+    store, _ = future_lot(tmp_path)
+    store.connection.execute("UPDATE v2_lots SET manual_take_profit_price='600', manual_stop_price='90' WHERE lot_id='lot'")
+    store.connection.commit()
+    exchange = FlatExchange()
+    exchange.latest_price = lambda symbol: Decimal("500")
+    engine = Engine(live_config(tmp_path), exchange, store)
+    engine._manage_lot(store.lot("lot"), datetime.now(UTC), {})
+    assert store.lot("lot")["status"] == "OPEN"
+    engine.close()
+
+
+def test_exit_fill_backfill_restores_price_and_gross_pnl(tmp_path):
+    store = Store(tmp_path / "state.db")
+    add_lot(store)
+    store.begin_order({"client_id": "exit", "lot_id": "lot", "role": "EXIT", "symbol": "ABCUSDT",
+                       "side": "BUY", "position_side": "SHORT", "requested_quantity": "2", "reason": "PLANNED_EXIT"})
+    store.apply_order("exit", {"status": "FILLED", "executedQty": "2", "avgPrice": "0", "orderId": "42"},
+                      datetime.now(UTC))
+    assert snapshot(tmp_path / "state.db")["closed"][0]["gross_pnl"] is None
+    exchange = FlatExchange()
+    exchange.user_trades = lambda symbol, order_id: [
+        {"orderId": "42", "side": "BUY", "positionSide": "SHORT", "qty": "1", "price": "90"},
+        {"orderId": "42", "side": "BUY", "positionSide": "SHORT", "qty": "1", "price": "80"},
+    ]
+    engine = Engine(live_config(tmp_path), exchange, store)
+    assert engine.backfill_exit_prices(force=True) == 1
+    closed = snapshot(tmp_path / "state.db")["closed"][0]
+    assert closed["exit_price"] == "85"
+    assert closed["gross_pnl"] == "30"
+    assert engine.backfill_exit_prices(force=True) == 0
+    engine.close()
+
+
 def test_manual_sell_uses_existing_exit_flow_and_closes_only_requested_lot(tmp_path):
     store, scheduled = future_lot(tmp_path)
     add_lot(store, lot_id="sibling", strategy="long")
@@ -101,13 +179,14 @@ def test_dashboard_requires_token_and_secure_origin_for_manual_action(tmp_path, 
             server["instance"] = self
             ready.set()
     monkeypatch.setattr(dashboard, "ThreadingHTTPServer", LocalServer)
-    token = sha256(b"zjr123321").hexdigest()
+    token = sha256(b"test-only-password").hexdigest()
     worker = Thread(target=dashboard.serve, args=(tmp_path / "state.db", "127.0.0.1", 0, token), daemon=True)
     worker.start()
     assert ready.wait(3)
     port = server["instance"].server_address[1]
     url = f"http://127.0.0.1:{port}/api/manual-action"
-    body = json.dumps({"lot_id": "lot", "action": "EXTEND_4H", "expected_exit_time": scheduled}).encode()
+    body = json.dumps({"lot_id": "lot", "action": "EXTEND", "expected_exit_time": scheduled,
+                       "extension_hours": 6, "stop_loss_price": "90", "take_profit_price": "120"}).encode()
     def request(origin, key):
         headers = {"Content-Type": "application/json", "X-Control-Token": key}
         if origin:
@@ -123,6 +202,7 @@ def test_dashboard_requires_token_and_secure_origin_for_manual_action(tmp_path, 
         with request(f"http://127.0.0.1:{port}", token) as response:
             assert response.status == 202
         assert len(store.pending_manual_actions()) == 1
+        assert store.pending_manual_actions()[0]["extension_hours"] == 6
         for _ in range(10):
             with pytest.raises(HTTPError) as incorrect:
                 request(f"http://127.0.0.1:{port}", "wrong")
